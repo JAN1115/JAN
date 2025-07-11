@@ -3,151 +3,107 @@ import random
 import copy
 from collections import Counter
 import numpy as np
-from itertools import groupby
 
-class MetaAdaptivePredictor:
-    def __init__(self, warmup_turns=3):
+# ==== 연패 방지 실전형 AI 클래스 ====
+class AntiLosingStreakAI:
+    def __init__(self, min_history=4, warmup_turns=3, break_loss=3):
+        self.min_history = min_history
+        self.warmup_turns = warmup_turns
+        self.break_loss = break_loss
         self.history = []
+        self.pb_history = []
         self.correct = 0
         self.incorrect = 0
         self.current_win = 0
         self.current_loss = 0
         self.max_win = 0
         self.max_loss = 0
-        self.warmup_turns = warmup_turns
+
         self.last_result = None
-        self.next_prediction = None
         self.prev_prediction = None
-        self.mode = "NORMAL"   # 현재 모드: NORMAL/REVERSE/TREND/CYCLE/RANDOM
-        self.mode_score = Counter()
+        self.next_prediction = None
+
         self.hit_history = []
 
-    # ========== 패턴 구간 감지 ==========
-    def detect_reverse(self, window=8):
-        # 최근 window 중 예측이 60% 이상 반대로 나올 때
-        if len(self.hit_history) < window: return False
-        rev_cnt = sum(1 for x in self.hit_history[-window:] if x is False)
-        return rev_cnt / window > 0.6
-
-    def detect_trend(self, window=7):
-        if len(self.history) < window: return None
-        cnt = Counter(self.history[-window:])
-        if max(cnt.values()) >= window - 1:
-            return cnt.most_common(1)[0][0]
+    # 최근 N턴 트렌드
+    def trend_predict(self, window=3):
+        pure = [x for x in self.pb_history if x in ('P','B')]
+        if len(pure) < window:
+            return None
+        cnt = Counter(pure[-window:])
+        if cnt['P'] > cnt['B']:
+            return 'P'
+        elif cnt['B'] > cnt['P']:
+            return 'B'
         return None
 
-    def detect_cycle(self, maxlen=4):
-        for n in range(maxlen, 1, -1):
-            if len(self.history) < n * 2: continue
-            last = self.history[-n:]
-            prev = self.history[-n*2:-n]
-            if last == prev:
-                return last
-        return None
-
-    def detect_random(self, window=14):
-        if len(self.history) < window: return False
-        cnt = Counter(self.history[-window:])
-        diff = abs(cnt['P'] - cnt['B'])
-        return diff <= 3  # 비슷하게 나올 때
-
-    # ========== 예측 전략 (각 상황별) ==========
-    def ngram_predict(self, maxn=5):
-        # 기본 n-그램 예측 (최근 패턴 기반)
-        best = []
-        for n in range(maxn, 1, -1):
-            if len(self.history) < n: continue
-            key = tuple(self.history[-n:])
-            c = Counter()
-            for i in range(len(self.history)-n):
-                if tuple(self.history[i:i+n]) == key:
-                    c[self.history[i+n]] += 1
-            if c:
-                best.append(c.most_common(1)[0][0])
-        if best:
-            return Counter(best).most_common(1)[0][0]
-        return None
-
-    def trend_predict(self):
-        trend = self.detect_trend(window=7)
-        return trend if trend else None
-
-    def cycle_predict(self):
-        cycle = self.detect_cycle(maxlen=4)
-        if cycle:
-            idx = (len(self.history)) % len(cycle)
-            return cycle[idx]
-        return None
-
+    # 직전과 반대
     def reverse_predict(self):
-        # 가장 최근 예측의 반대로
-        if self.prev_prediction in ('P','B'):
-            return 'B' if self.prev_prediction == 'P' else 'P'
+        pure = [x for x in self.pb_history if x in ('P','B')]
+        if not pure:
+            return random.choice(['P', 'B'])
+        return 'B' if pure[-1] == 'P' else 'P'
+
+    # n-gram 단기 앙상블
+    def ngram_predict(self, maxn=4):
+        pure = [x for x in self.pb_history if x in ('P','B')]
+        for n in range(maxn, 1, -1):
+            if len(pure) < n: continue
+            key = tuple(pure[-n:])
+            c = Counter()
+            for i in range(len(pure)-n):
+                if tuple(pure[i:i+n]) == key:
+                    c[pure[i+n]] += 1
+            if c:
+                return c.most_common(1)[0][0]
         return None
 
-    def random_predict(self):
-        return random.choice(['P', 'B'])
-
-    def meta_predict(self):
-        votes = []
-        # ngram, trend, cycle, reverse, random 각 전략으로 예측
-        ngram = self.ngram_predict()
-        if ngram: votes.append(('ngram', ngram))
-        trend = self.trend_predict()
-        if trend: votes.append(('trend', trend))
-        cycle = self.cycle_predict()
-        if cycle: votes.append(('cycle', cycle))
-        if self.mode == "REVERSE":
-            rev = self.reverse_predict()
-            if rev: votes.extend([('reverse', rev)]*2)  # 역베팅은 2표
-        if self.mode == "RANDOM":
-            votes.append(('random', self.random_predict()))
-
-        # 투표 가중치: 모드에 따라 해당 예측 2표
-        if self.mode == "TREND" and trend: votes.append(('trend', trend))
-        if self.mode == "CYCLE" and cycle: votes.append(('cycle', cycle))
-        if self.mode == "NORMAL" and ngram: votes.append(('ngram', ngram))
-        # 1표도 없으면 랜덤
-        if not votes:
-            pred = self.random_predict()
+    def smart_predict(self):
+        # 연패구간 진입 시 즉시 단기 믹스 전략
+        if self.current_loss >= self.break_loss:
+            choices = [
+                self.reverse_predict(),
+                self.trend_predict(window=2),
+                self.trend_predict(window=3),
+                self.ngram_predict(maxn=2),
+                self.ngram_predict(maxn=3),
+                random.choice(['P','B'])
+            ]
+            filtered = [v for v in choices if v in ('P','B')]
+            return random.choice(filtered) if filtered else random.choice(['P','B'])
         else:
-            by_val = Counter([v for k,v in votes])
-            pred = by_val.most_common(1)[0][0]
-        self.prev_prediction = pred
-        self.next_prediction = pred
-        return pred
-
-    # ========== 전략 선택/적응 ==========
-    def update_mode(self):
-        # 최근 결과/패턴 기반으로 현재 전략 모드 전환
-        if self.detect_reverse(window=8):
-            self.mode = "REVERSE"
-        elif self.detect_trend(window=7):
-            self.mode = "TREND"
-        elif self.detect_cycle(maxlen=4):
-            self.mode = "CYCLE"
-        elif self.detect_random(window=14):
-            self.mode = "RANDOM"
-        else:
-            self.mode = "NORMAL"
-        self.mode_score[self.mode] += 1
+            # 평상시엔 단기 앙상블
+            choices = [
+                self.trend_predict(window=3),
+                self.ngram_predict(maxn=4),
+                self.reverse_predict()
+            ]
+            filtered = [v for v in choices if v in ('P','B')]
+            return Counter(filtered).most_common(1)[0][0] if filtered else random.choice(['P','B'])
 
     def handle_input(self, r):
-        self.update_mode()
-        pred = self.next_prediction
-        self.history.append(r)
-        if len([x for x in self.history if x in ('P','B')]) <= self.warmup_turns:
+        if r == 'T':
+            self.history.append('T')
             self.last_result = None
-            self.next_prediction = self.meta_predict()
+            self.prev_prediction = self.next_prediction
+            self.prepare_next_prediction()
             return
-        if pred in ('P', 'B') and r in ('P', 'B'):
-            hit = (pred == r)
+        self.pb_history.append(r)
+        self.history.append(r)
+        self.prev_prediction = self.next_prediction
+        if len(self.pb_history) <= self.warmup_turns:
+            self.last_result = None
+            self.prepare_next_prediction()
+            return
+        prev_pred = self.prev_prediction
+        if prev_pred in ('P', 'B') and r in ('P', 'B'):
+            hit = (prev_pred == r)
             self.last_result = hit
             if hit:
                 self.correct += 1
                 self.current_win += 1
-                self.max_win = max(self.max_win, self.current_win)
                 self.current_loss = 0
+                self.max_win = max(self.max_win, self.current_win)
             else:
                 self.incorrect += 1
                 self.current_win = 0
@@ -156,21 +112,14 @@ class MetaAdaptivePredictor:
             self.hit_history.append(hit)
         else:
             self.last_result = None
-        self.next_prediction = self.meta_predict()
+        self.prepare_next_prediction()
+
+    def prepare_next_prediction(self):
+        self.next_prediction = self.smart_predict()
 
     def stats(self):
-        total_pb = len([x for x in self.history if x in ('P','B')])
+        total_pb = len(self.pb_history)
         hitrate = round(self.correct / total_pb * 100, 2) if total_pb else 0
-        # 연승/연패 집계
-        win_list = []
-        loss_list = []
-        if self.hit_history:
-            for k, g in groupby(self.hit_history):
-                length = sum(1 for _ in g)
-                if k:
-                    win_list.append(length)
-                else:
-                    loss_list.append(length)
         return {
             '총입력':       len(self.history),
             '총예측(P/B)':  total_pb,
@@ -180,14 +129,12 @@ class MetaAdaptivePredictor:
             '현재연승':      self.current_win,
             '현재연패':      self.current_loss,
             '최대연승':      self.max_win,
-            '최대연패':      self.max_loss,
-            '평균연승':      round(np.mean(win_list),2) if win_list else 0,
-            '평균연패':      round(np.mean(loss_list),2) if loss_list else 0,
+            '최대연패':      self.max_loss
         }
 
-# ====== Streamlit UI 이하 구조 동일 (pred만 교체) ======
+# ========== Streamlit UI ==========
 
-st.set_page_config(layout="wide", page_title="실전 AI 적응형 예측기", page_icon="🦾")
+st.set_page_config(layout="wide", page_title="AI 연패방지 예측기", page_icon="🛡️")
 st.markdown("""
     <style>
     html, body, [data-testid="stAppViewContainer"] {
@@ -216,7 +163,7 @@ st.markdown("""
 if 'stack' not in st.session_state:
     st.session_state.stack = []
 if 'pred' not in st.session_state:
-    st.session_state.pred = MetaAdaptivePredictor()
+    st.session_state.pred = AntiLosingStreakAI()
 pred = st.session_state.pred
 
 def push_state():
@@ -225,7 +172,7 @@ def undo():
     if st.session_state.stack:
         st.session_state.pred = st.session_state.stack.pop()
 def full_reset():
-    st.session_state.pred = MetaAdaptivePredictor()
+    st.session_state.pred = AntiLosingStreakAI()
     st.session_state.stack.clear()
 
 ICONS = {'P':'🔵','B':'🔴','T':'🟢'}
@@ -247,17 +194,16 @@ with btn_cols[4]:
     if st.button("🗑️", key="btnR1", use_container_width=True):
         full_reset()
 
-# 2. 예측 결과
-if len([x for x in pred.history if x in ('P','B')]) < pred.warmup_turns:
+if len(pred.pb_history) < pred.warmup_turns:
     st.markdown('<div class="neon" style="font-size:1.15em;">데이터 쌓는 중...</div>', unsafe_allow_html=True)
-elif len([x for x in pred.history if x in ('P','B')]) == pred.warmup_turns:
+elif len(pred.pb_history) == pred.warmup_turns:
     if pred.next_prediction:
         st.markdown(f'<div class="neon" style="font-size:1.7em;">🎯 4번째 턴 예측 → {ICONS[pred.next_prediction]}</div>', unsafe_allow_html=True)
     st.info(f"{pred.warmup_turns}턴 데이터 쌓기 끝! 이제 4번째 턴부터 예측/적중/통계 집계 시작.")
 else:
     if pred.next_prediction:
         st.markdown(
-            f'<div class="neon" style="font-size:2.1em;">🎯 예측 → {ICONS[pred.next_prediction]} <span style="font-size:0.6em;">[{pred.mode}]</span></div>',
+            f'<div class="neon" style="font-size:2.1em;">🎯 예측 → {ICONS[pred.next_prediction]}</div>',
             unsafe_allow_html=True
         )
     if hasattr(pred, 'last_result'):
@@ -266,7 +212,7 @@ else:
         elif pred.last_result is False:
             st.error("❌ 미적중")
 
-# 3. 6매 기록
+# 6매 기록 표시
 st.markdown('<div class="neon" style="font-size:1em;">6매 기록</div>', unsafe_allow_html=True)
 history = pred.history
 max_row = 6
@@ -277,7 +223,7 @@ for r in range(max_row):
     for c in range(cols):
         idx = c * max_row + r
         if idx < len(history):
-            row.append(ICONS.get(history[idx], "　"))
+            row.append(ICONS[history[idx]])
         else:
             row.append("　")
     six_grid.append(row)
@@ -288,7 +234,7 @@ six_html += '</div>'
 st.markdown(six_html, unsafe_allow_html=True)
 st.markdown("---")
 
-# 4. 통계
+# 통계
 s = pred.stats()
 stat_cols = st.columns([1,1,1,1])
 stat_cols[0].markdown(f"<div class='neon'>현재 연승<br><span style='font-size:1.08em'>{s['현재연승']}</span></div>", unsafe_allow_html=True)
@@ -298,8 +244,8 @@ stat_cols[3].markdown(f"<div style='color:#fa5252'>최대연패<br><span style='
 with st.expander("📊 전체 통계 자세히 (터치/클릭)", expanded=False):
     st.json(s)
 
-st.markdown('<div class="neon" style="font-size:1.18em; margin-top:0.7em;">AI 실전 적응형 메타 러너 예측기</div>', unsafe_allow_html=True)
-st.markdown('<div class="neon-pink" style="font-size:0.95em;">복합 패턴 자동 감지/전략 전환/실전 적중률 강화</div>', unsafe_allow_html=True)
+st.markdown('<div class="neon" style="font-size:1.18em; margin-top:0.7em;">AI 연패방지 예측기</div>', unsafe_allow_html=True)
+st.markdown('<div class="neon-pink" style="font-size:0.95em;">연패 3~4회 즉시 전략전환/사람 스타일</div>', unsafe_allow_html=True)
 
 if pred.next_prediction is None:
-    pred.next_prediction = pred.meta_predict()
+    pred.prepare_next_prediction()
