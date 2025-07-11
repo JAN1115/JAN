@@ -2,14 +2,12 @@ import streamlit as st
 import random
 import copy
 from collections import Counter
-import numpy as np
 
-# ==== 연패 방지 실전형 AI 클래스 ====
-class AntiLosingStreakAI:
-    def __init__(self, min_history=4, warmup_turns=3, break_loss=3):
+# ----------------------- UltraSafetyAI -----------------------
+class UltraSafetyAI:
+    def __init__(self, min_history=4, warmup_turns=3):
         self.min_history = min_history
         self.warmup_turns = warmup_turns
-        self.break_loss = break_loss
         self.history = []
         self.pb_history = []
         self.correct = 0
@@ -22,11 +20,15 @@ class AntiLosingStreakAI:
         self.last_result = None
         self.prev_prediction = None
         self.next_prediction = None
-
         self.hit_history = []
 
-    # 최근 N턴 트렌드
-    def trend_predict(self, window=3):
+    def reverse_predict(self):
+        pure = [x for x in self.pb_history if x in ('P','B')]
+        if not pure:
+            return random.choice(['P', 'B'])
+        return 'B' if pure[-1] == 'P' else 'P'
+
+    def trend_predict(self, window=2):
         pure = [x for x in self.pb_history if x in ('P','B')]
         if len(pure) < window:
             return None
@@ -37,15 +39,7 @@ class AntiLosingStreakAI:
             return 'B'
         return None
 
-    # 직전과 반대
-    def reverse_predict(self):
-        pure = [x for x in self.pb_history if x in ('P','B')]
-        if not pure:
-            return random.choice(['P', 'B'])
-        return 'B' if pure[-1] == 'P' else 'P'
-
-    # n-gram 단기 앙상블
-    def ngram_predict(self, maxn=4):
+    def ngram_predict(self, maxn=3):
         pure = [x for x in self.pb_history if x in ('P','B')]
         for n in range(maxn, 1, -1):
             if len(pure) < n: continue
@@ -58,24 +52,22 @@ class AntiLosingStreakAI:
                 return c.most_common(1)[0][0]
         return None
 
-    def smart_predict(self):
-        # 연패구간 진입 시 즉시 단기 믹스 전략
-        if self.current_loss >= self.break_loss:
-            choices = [
-                self.reverse_predict(),
-                self.trend_predict(window=2),
-                self.trend_predict(window=3),
-                self.ngram_predict(maxn=2),
-                self.ngram_predict(maxn=3),
-                random.choice(['P','B'])
-            ]
-            filtered = [v for v in choices if v in ('P','B')]
-            return random.choice(filtered) if filtered else random.choice(['P','B'])
+    def ultra_safety_predict(self):
+        L = self.current_loss
+        if L >= 6:
+            return random.choice(['P', 'B'])
+        elif L == 5:
+            return 'B' if self.prev_prediction == 'P' else 'P'
+        elif L == 4:
+            choices = [self.reverse_predict(), random.choice(['P','B']), self.reverse_predict()]
+            return random.choice(choices)
+        elif L == 3:
+            last = self.pb_history[-1] if len(self.pb_history) > 0 else random.choice(['P', 'B'])
+            return 'B' if last == 'P' else 'P'
         else:
-            # 평상시엔 단기 앙상블
             choices = [
                 self.trend_predict(window=3),
-                self.ngram_predict(maxn=4),
+                self.ngram_predict(maxn=3),
                 self.reverse_predict()
             ]
             filtered = [v for v in choices if v in ('P','B')]
@@ -115,7 +107,7 @@ class AntiLosingStreakAI:
         self.prepare_next_prediction()
 
     def prepare_next_prediction(self):
-        self.next_prediction = self.smart_predict()
+        self.next_prediction = self.ultra_safety_predict()
 
     def stats(self):
         total_pb = len(self.pb_history)
@@ -132,20 +124,15 @@ class AntiLosingStreakAI:
             '최대연패':      self.max_loss
         }
 
-# ========== Streamlit UI ==========
-
-st.set_page_config(layout="wide", page_title="AI 연패방지 예측기", page_icon="🛡️")
+# ------------------- Streamlit UI -------------------
+st.set_page_config(layout="wide", page_title="UltraSafetyAI 연패방지 바카라", page_icon="🦾")
 st.markdown("""
     <style>
-    html, body, [data-testid="stAppViewContainer"] {
-        background: #181c21 !important; color: #eee;
-    }
+    html, body, [data-testid="stAppViewContainer"] {background: #181c21 !important; color: #eee;}
     .stButton>button {
         background: #23222a !important; color: #fff !important;
-        font-size: 1.0em !important;
-        border: 1.5px solid #39f3fa66 !important;
-        border-radius: 10px !important;
-        padding: 0.23em 0.1em !important;
+        font-size: 1.0em !important; border: 1.5px solid #39f3fa66 !important;
+        border-radius: 10px !important; padding: 0.23em 0.1em !important;
         min-width: 32px !important; min-height: 32px !important;
         margin: 1px 1px 1px 1px !important; cursor: pointer !important;
         transition: 0.2s !important; box-shadow: 0 0 7px #39f3fa22 !important;
@@ -163,7 +150,7 @@ st.markdown("""
 if 'stack' not in st.session_state:
     st.session_state.stack = []
 if 'pred' not in st.session_state:
-    st.session_state.pred = AntiLosingStreakAI()
+    st.session_state.pred = UltraSafetyAI()
 pred = st.session_state.pred
 
 def push_state():
@@ -172,7 +159,7 @@ def undo():
     if st.session_state.stack:
         st.session_state.pred = st.session_state.stack.pop()
 def full_reset():
-    st.session_state.pred = AntiLosingStreakAI()
+    st.session_state.pred = UltraSafetyAI()
     st.session_state.stack.clear()
 
 ICONS = {'P':'🔵','B':'🔴','T':'🟢'}
@@ -201,6 +188,9 @@ elif len(pred.pb_history) == pred.warmup_turns:
         st.markdown(f'<div class="neon" style="font-size:1.7em;">🎯 4번째 턴 예측 → {ICONS[pred.next_prediction]}</div>', unsafe_allow_html=True)
     st.info(f"{pred.warmup_turns}턴 데이터 쌓기 끝! 이제 4번째 턴부터 예측/적중/통계 집계 시작.")
 else:
+    # NEW: 연패구간 표시!
+    if pred.current_loss >= 3:
+        st.markdown(f"<div class='neon-pink' style='font-size:1.12em'>⚡연패구간: {pred.current_loss}회</div>", unsafe_allow_html=True)
     if pred.next_prediction:
         st.markdown(
             f'<div class="neon" style="font-size:2.1em;">🎯 예측 → {ICONS[pred.next_prediction]}</div>',
@@ -212,7 +202,7 @@ else:
         elif pred.last_result is False:
             st.error("❌ 미적중")
 
-# 6매 기록 표시
+# 6매 기록
 st.markdown('<div class="neon" style="font-size:1em;">6매 기록</div>', unsafe_allow_html=True)
 history = pred.history
 max_row = 6
@@ -244,8 +234,8 @@ stat_cols[3].markdown(f"<div style='color:#fa5252'>최대연패<br><span style='
 with st.expander("📊 전체 통계 자세히 (터치/클릭)", expanded=False):
     st.json(s)
 
-st.markdown('<div class="neon" style="font-size:1.18em; margin-top:0.7em;">AI 연패방지 예측기</div>', unsafe_allow_html=True)
-st.markdown('<div class="neon-pink" style="font-size:0.95em;">연패 3~4회 즉시 전략전환/사람 스타일</div>', unsafe_allow_html=True)
+st.markdown('<div class="neon" style="font-size:1.18em; margin-top:0.7em;">UltraSafetyAI 연패방지 AI 바카라</div>', unsafe_allow_html=True)
+st.markdown('<div class="neon-pink" style="font-size:0.95em;">실전형 연패자동회피 · 초민감 전략전환</div>', unsafe_allow_html=True)
 
 if pred.next_prediction is None:
     pred.prepare_next_prediction()
