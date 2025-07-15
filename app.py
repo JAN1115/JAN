@@ -61,7 +61,7 @@ class ConcordanceAI:
         }
         self.betting_phase = 'A'
         self.phase_turn = 0
-        self.phase_fails = 0 # 3연속 미적중 추적 변수
+        self.phase_fails = 0 
         self.cooldown_turns = 0
         self.prediction_plan = []
 
@@ -103,6 +103,7 @@ class ConcordanceAI:
     def process_next_turn(self):
         self.should_bet_now = False
         self.next_prediction = None
+        self.popup_trigger = False
 
         if len(self.pb_history) < 6:
             self.analysis_text = f"AI: 데이터 수집 중... ({len(self.pb_history)}/6)"
@@ -117,13 +118,13 @@ class ConcordanceAI:
             ranked = self._get_ranked_predictors()
             worst_key, best_key = ranked[0], ranked[-1]
             all_preds = self._get_all_predictions(self.pb_history)
-
             phase_map = {
                 'A': [best_key, worst_key, best_key],
                 'B': [worst_key, best_key, worst_key]
             }
             self.prediction_plan = [all_preds[key] for key in phase_map[self.betting_phase]]
             self.phase_turn = 0
+            self.phase_fails = 0
             self.analysis_text = f"AI: Phase {self.betting_phase} 계획 수립 완료: {self.prediction_plan}"
 
         if self.prediction_plan:
@@ -148,35 +149,30 @@ class ConcordanceAI:
         
         if self.should_bet_now:
             self.bet_count += 1
-            if self.next_prediction == r: # 적중
+            if self.next_prediction == r:
                 self.correct += 1; self.current_win += 1; self.current_loss = 0
                 self.max_win = max(self.max_win, self.current_win)
                 self.popup_type = "hit"; self.hit_record.append("O")
-                self.prediction_plan = []
-                self.phase_turn = 0
-                self.phase_fails = 0 # 리셋
+                self.prediction_plan = []; self.phase_turn = 0; self.phase_fails = 0
                 self.cooldown_turns = 3
                 self.betting_phase = 'B' if self.betting_phase == 'A' else 'A'
-            else: # 미적중
+            else:
                 self.incorrect += 1; self.current_win = 0; self.current_loss += 1
                 self.max_loss = max(self.max_loss, self.current_loss)
                 self.popup_type = "miss"; self.hit_record.append("X")
                 self.phase_fails += 1
                 self.phase_turn += 1
-                if self.phase_turn >= len(self.prediction_plan): # 계획 모두 실행
-                    # --- 버그 수정: 3연속 미적중 시 휴식 ---
+                if self.phase_turn >= len(self.prediction_plan):
                     if self.phase_fails >= 3:
                         self.cooldown_turns = 3
-                    self.prediction_plan = []
-                    self.phase_turn = 0
-                    self.phase_fails = 0 # 리셋
+                    self.prediction_plan = []; self.phase_turn = 0; self.phase_fails = 0
                     self.betting_phase = 'B' if self.betting_phase == 'A' else 'A'
             self.popup_trigger = True
         else:
             self.hit_record.append(None)
         
         self.history.append(r)
-        self.pb_history.append(r)
+        if r in 'PB': self.pb_history.append(r)
         self.process_next_turn()
 
     def get_stats(self):
@@ -190,62 +186,78 @@ if 'stack' not in st.session_state: st.session_state.stack = []
 if 'prev_stats' not in st.session_state: st.session_state.prev_stats = {}
 pred = st.session_state.pred
 
-st.set_page_config(layout="wide", page_title="MetaRunner AI v4.2", page_icon="🧠")
+st.set_page_config(layout="wide", page_title="MetaRunner AI", page_icon="🧠")
 st.markdown("""<style>
 html,body,[data-testid="stAppViewContainer"],[data-testid="stHeader"]{background:#0c111b!important;color:#e0fcff!important;}
 .stButton>button{border:none;border-radius:12px;padding:12px 24px;color:white;font-size:1.1em;font-weight:bold;transition:all .3s ease-out;}.stButton>button:hover{transform:translateY(-3px);filter:brightness(1.3);}
 div[data-testid="stHorizontalBlock"]>div:nth-child(1) .stButton>button{background:#0c3483;box-shadow:0 0 8px #3b82f6,0 0 12px #3b82f6;}
 div[data-testid="stHorizontalBlock"]>div:nth-child(2) .stButton>button{background:#880e4f;box-shadow:0 0 8px #f06292,0 0 12px #f06292;}
 div[data-testid="stHorizontalBlock"]>div:nth-child(3) .stButton>button{background:#1b5e20;box-shadow:0 0 8px #4caf50,0 0 12px #4caf50;}
-.result-toast{display:inline-block;padding:10px 25px;border-radius:20px;font-size:1.4em;font-weight:bold;color:white;animation:fade-in-out 2s ease-in-out forwards;}
-.result-toast.hit{background:linear-gradient(145deg,#28a745,#1f8336);box-shadow:0 0 15px #34ff71;}
-.result-toast.miss{background:linear-gradient(145deg,#dc3545,#b32a38);box-shadow:0 0 15px #ff4d60;}
-@keyframes fade-in-out{0%{opacity:0;transform:scale(.8)}20%{opacity:1;transform:scale(1.05)}80%{opacity:1;transform:scale(1);padding:10px 25px}100%{opacity:0;transform:scale(.8);height:0;padding:0;border:0}}
 .sixgrid-symbol{border-radius:50%;font-weight:bold;padding:1.5px 7px;display:inline-block;}.sixgrid-fluo{color:#d4ffb3;background:rgba(100,255,110,.25);}.sixgrid-miss{color:#ffb3b3;background:rgba(255,100,110,.25);}
 .stat-changed{animation:flash 1s ease-out;} @keyframes flash{50%{background:rgba(40,167,69,.3);transform:scale(1.05);}}
 .rotating-hourglass{display:inline-block;animation:rotate 2s linear infinite;} @keyframes rotate{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
+.next-prediction-box {font-size:1.8em;font-weight:bold;color:#00fffa!important;animation:prediction-pop-in .5s ease-out;}
+@keyframes prediction-pop-in {0%{transform:scale(.5);opacity:0}100%{transform:scale(1);opacity:1}}
+.top-notification {text-align:center;font-weight:bold;color:white;padding:8px;margin:-10px -10px 10px -10px;border-radius:8px;animation:slide-in-out 2.5s ease-in-out forwards;}
+.top-notification.hit { background: linear-gradient(90deg, #28a745, #1f8336); }
+.top-notification.miss { background: linear-gradient(90deg, #dc3545, #b32a38); }
+@keyframes slide-in-out {0%{transform:translateY(-100%);opacity:0} 15%{transform:translateY(0);opacity:1} 85%{transform:translateY(0);opacity:1} 100%{transform:translateY(-100%);opacity:0}}
+@media (max-width: 768px) {
+    .stButton>button { padding: 10px 18px; font-size: 1.0em; }
+    .next-prediction-box { font-size: 1.5em; }
+    .stats-container { grid-template-columns: 1fr 1fr !important; }
+    .stExpander { margin-bottom: 10px; }
+}
 </style>""", unsafe_allow_html=True)
+
+if pred.popup_trigger:
+    result_class = "hit" if pred.popup_type == "hit" else "miss"
+    result_text = "🎉 적중!" if pred.popup_type == "hit" else "💥 미적중!"
+    st.markdown(f'<div class="top-notification {result_class}">{result_text}</div>', unsafe_allow_html=True)
 
 st.markdown(f"🧠 **AI 분석**: {pred.analysis_text}", unsafe_allow_html=True)
 
 npred, should_bet = pred.next_prediction, pred.should_bet_now
 if should_bet and npred:
     ICONS = {'P':'🔵','B':'🔴'}
-    st.markdown(f'<div style="text-align:center;font-size:2.05em;font-weight:bold;color:#00fffa!important;">🔮 BET {ICONS[npred]}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div style="text-align:center;margin:5px 0 15px 0;"><span class="next-prediction-box">NEXT {ICONS[npred]}</span></div>', unsafe_allow_html=True)
 else:
-    st.markdown(f'<div style="text-align:center;"><div style="background:#2b2900;border-radius:16px;padding:10px 32px;margin:20px auto;color:#ffd400;font-size:1.22em;font-weight:900;display:inline-block;"><span class="rotating-hourglass">⏳</span> AI 대기중...</div></div>', unsafe_allow_html=True)
+    st.markdown(f'<div style="text-align:center;"><div style="background:#2b2900;border-radius:16px;padding:10px 32px;margin:10px auto;color:#ffd400;font-size:1.22em;font-weight:900;display:inline-block;"><span class="rotating-hourglass">⏳</span> AI 대기중...</div></div>', unsafe_allow_html=True)
 
-if pred.popup_trigger:
-    result_class = "hit" if pred.popup_type == "hit" else "miss"
-    result_text = "🎉 적중!" if pred.popup_type == "hit" else "💥 미적중!"
-    st.markdown(f'<div style="text-align:center;"><span class="result-toast {result_class}">{result_text}</span></div>', unsafe_allow_html=True)
-    pred.popup_trigger = False
+col1, col2 = st.columns(2)
+with col1:
+    with st.expander("📈 알고리즘 성과 보기"):
+        predictor_keys = list(pred.predictor_stats.keys())
+        sub_cols = st.columns(len(predictor_keys))
+        for i, key in enumerate(predictor_keys):
+            stats = pred.predictor_stats[key]
+            rate = round(stats['hits'] / stats['bets'] * 100, 1) if stats['bets'] > 0 else 0
+            with sub_cols[i]:
+                st.metric(label=f"{key.upper()}", value=f"{rate}%")
 
-with st.expander("📈 알고리즘 성과 순위 보기 (최악->최선 순)"):
-    ranked_keys = pred._get_ranked_predictors()
-    cols = st.columns(len(ranked_keys))
-    for i, key in enumerate(ranked_keys):
-        stats = pred.predictor_stats[key]
-        rate = round(stats['hits'] / stats['bets'] * 100, 1) if stats['bets'] > 0 else 0
-        with cols[i]:
-            st.metric(label=f"{(key.upper())}", value=f"{rate}%", delta=f"{stats['hits']}/{stats['bets']} 적중")
+with col2:
+    s, prev_s = pred.get_stats(), st.session_state.prev_stats
+    win_changed = "stat-changed" if s['현재연승'] > 0 and s['현재연승'] != prev_s.get('현재연승', 0) else ""
+    loss_changed = "stat-changed" if s['현재연패'] > 0 and s['현재연패'] != prev_s.get('현재연패', 0) else ""
+    st.markdown(f"""
+    <div class="stats-container" style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+        <div style="background:rgba(30,45,60,.5);border-radius:10px;padding:5px;text-align:center;">🎯적중률<br><span style="color:#fff;font-size:1.2em;">{s['적중률(%)']}%</span></div>
+        <div style="background:rgba(30,45,60,.5);border-radius:10px;padding:5px;text-align:center;">📊총 베팅<br><span style="color:#fff;font-size:1.2em;">{pred.bet_count}/{s['총입력']}</span></div>
+        <div class="{win_changed}" style="background:rgba(30,45,60,.5);border-radius:10px;padding:5px;text-align:center;">💡연승<br><span style="color:#fff;font-size:1.2em;">{s['현재연승']} (최대 {s['최대연승']})</span></div>
+        <div class="{loss_changed}" style="background:rgba(30,45,60,.5);border-radius:10px;padding:5px;text-align:center;">🔥연패<br><span style="color:#fff;font-size:1.2em;">{s['현재연패']} (최대 {s['최대연패']})</span></div>
+    </div>
+    """, unsafe_allow_html=True)
+    st.session_state.prev_stats = s.copy()
 
-s, prev_s = pred.get_stats(), st.session_state.prev_stats
-win_changed = "stat-changed" if s['현재연승'] > 0 and s['현재연승'] != prev_s.get('현재연승', 0) else ""
-loss_changed = "stat-changed" if s['현재연패'] > 0 and s['현재연패'] != prev_s.get('현재연패', 0) else ""
-st.markdown(f"""
-<div style="display:flex;justify-content:center;gap:15px;margin:20px 0;flex-wrap:wrap;">
-    <div style="background:rgba(30,45,60,.5);border-radius:10px;padding:5px 12px;">🎯 적중률<span style="color:#fff;font-size:1.1em;margin-left:6px;">{s['적중률(%)']}%</span></div>
-    <div style="background:rgba(30,45,60,.5);border-radius:10px;padding:5px 12px;">📊 총 베팅<span style="color:#fff;font-size:1.1em;margin-left:6px;">{pred.bet_count}/{s['총입력']}</span></div>
-    <div class="{win_changed}" style="background:rgba(30,45,60,.5);border-radius:10px;padding:5px 12px;">💡 연승<span style="color:#fff;font-size:1.1em;margin-left:6px;">{s['현재연승']} (최대 {s['최대연승']})</span></div>
-    <div class="{loss_changed}" style="background:rgba(30,45,60,.5);border-radius:10px;padding:5px 12px;">🔥 연패<span style="color:#fff;font-size:1.1em;margin-left:6px;">{s['현재연패']} (최대 {s['최대연패']})</span></div>
-</div>
-""", unsafe_allow_html=True)
-st.session_state.prev_stats = s.copy()
+st.markdown('<div style="margin-top: 10px;"></div>', unsafe_allow_html=True)
 
+# --- 수정: handle_click에서 불필요한 st.rerun() 제거 ---
 def handle_click(result):
+    if 'stack' not in st.session_state: st.session_state.stack = []
     st.session_state.stack.append(copy.deepcopy(st.session_state.pred))
     st.session_state.pred.handle_input(result)
+    # on_click 콜백 후 자동으로 rerun되므로 이 코드는 제거해도 경고만 사라질 뿐 동작은 동일합니다.
+    # st.rerun() 
 
 button_cols = st.columns([1,1,1,0.5,0.5])
 button_cols[0].button("플레이어 (P)", use_container_width=True, on_click=handle_click, args=("P",))
@@ -262,12 +274,12 @@ if button_cols[4].button("🗑️", help="모든 기록을 초기화합니다.")
     st.session_state.stack = []
     st.rerun()
 
-st.markdown('<hr style="border:1px solid #222; margin: 20px 0;">', unsafe_allow_html=True)
+st.markdown('<hr style="border:1px solid #222; margin: 15px 0;">', unsafe_allow_html=True)
 st.markdown("🪧 <b>6매 기록</b>", unsafe_allow_html=True)
 history, hitrec = pred.history, pred.hit_record
 max_row = 6
 ncols = (len(history) + max_row - 1) // max_row if len(history) > 0 else 0
-six_html = '<table style="border-spacing:4px 2px;"><tbody>'
+six_html = '<table style="border-spacing:4px 2px;width:100%;"><tbody>'
 for r in range(max_row):
     six_html += "<tr>"
     for c in range(ncols):
@@ -280,7 +292,7 @@ for r in range(max_row):
                 if hitrec[idx] == "O": color_class = "sixgrid-fluo"
                 elif hitrec[idx] == "X": color_class = "sixgrid-miss"
             cell_content = f'<span class="sixgrid-symbol {color_class}">{val}</span>'
-        six_html += f"<td style='text-align:center;'>{cell_content}</td>"
+        six_html += f"<td style='padding:1px;text-align:center'>{cell_content}</td>"
     six_html += "</tr>"
 six_html += '</tbody></table>'
 st.markdown(six_html, unsafe_allow_html=True)
