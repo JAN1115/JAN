@@ -61,6 +61,7 @@ class ConcordanceAI:
         self.cooldown_turns = 0
         self.prediction_plan = []
         self.phase_turn = 0
+        self.phase_fails = 0
 
         self.analysis_text = "AI: 초기 데이터 수집 중..."
         self.popup_trigger, self.popup_type = False, None
@@ -84,22 +85,25 @@ class ConcordanceAI:
         else: preds['combo'] = random.choice(['P', 'B'])
         return preds
 
-    def _analyze_meta(self, pb_history):
+    def _analyze_meta_with_scores(self, pb_history):
         pure = [x for x in pb_history if x in 'PB']
-        if len(pure) < 6: return "혼돈"
-        
-        last6 = pure[-6:]
-        if last6.count('P') >= 5 or last6.count('B') >= 5: return "장줄"
-        
-        last4 = pure[-4:]
-        if last4 in (['P','B','P','B'], ['B','P','B','P']): return "퐁당퐁당"
+        if len(pure) < 6: return "혼돈", 0
 
-        # 선제적 진입 조건
-        if last4.count('P') == 3 or last4.count('B') == 3: return "혼돈 (장줄 조짐)"
-        last5 = pure[-5:]
-        if last5 in (['P','B','P','B','P'], ['B','P','B','P','B']): return "혼돈 (퐁당퐁당 조짐)"
+        last6 = pure[-6:]
+        streak_score = (max(last6.count('P'), last6.count('B')) - 3) * 30
+
+        zigzag_score = 0
+        for i in range(len(last6) - 1):
+            if last6[i] != last6[i+1]:
+                zigzag_score += 20
         
-        return "혼돈"
+        CONFIDENCE_THRESHOLD = 75
+        if streak_score > zigzag_score and streak_score >= CONFIDENCE_THRESHOLD:
+            return "장줄", streak_score
+        elif zigzag_score > streak_score and zigzag_score >= CONFIDENCE_THRESHOLD:
+            return "퐁당퐁당", zigzag_score
+        else:
+            return "혼돈", 0
 
     def process_next_turn(self):
         self.should_bet_now = False
@@ -116,27 +120,43 @@ class ConcordanceAI:
             return
         
         if not self.prediction_plan:
-            meta = self._analyze_meta(self.pb_history)
+            meta, meta_score = self._analyze_meta_with_scores(self.pb_history)
             all_preds = self._get_all_predictions(self.pb_history)
             
             plan_keys = []
-            if "장줄" in meta:
-                plan_keys = ['trend', 'combo', 'china']
-            elif "퐁당퐁당" in meta:
-                plan_keys = ['ngram', 'combo', 'china']
+            plan_meta = meta
             
-            if plan_keys: # 장줄 또는 퐁당퐁당 패턴 감지 시 계획 수립
+            if meta == "장줄":
+                expert_group = ['trend', 'combo', 'china']
+                def get_hit_rate(key):
+                    stats = self.predictor_stats[key]
+                    return stats['hits'] / stats['bets'] if stats['bets'] > 0 else 0
+                plan_keys = sorted(expert_group, key=get_hit_rate, reverse=True)
+            elif meta == "퐁당퐁당":
+                expert_group = ['ngram', 'combo', 'china']
+                def get_hit_rate(key):
+                    stats = self.predictor_stats[key]
+                    return stats['hits'] / stats['bets'] if stats['bets'] > 0 else 0
+                plan_keys = sorted(expert_group, key=get_hit_rate, reverse=True)
+            else: # 혼돈 상태
+                plan_meta = "혼돈"
+                votes = list(all_preds.values())
+                majority_pred = Counter(votes).most_common(1)[0][0]
+                # 다수결 -> 종합 -> 최근 패턴 순으로 계획 수립
+                chaos_plan = [majority_pred, all_preds['china'], all_preds['ngram']]
+                self.prediction_plan = chaos_plan
+            
+            if plan_keys:
                 self.prediction_plan = [all_preds[key] for key in plan_keys]
-                self.phase_turn = 0
-                self.analysis_text = f"AI: '{meta}' 패턴 감지, 계획 실행"
-            else: # 혼돈 상태일 때는 대기
-                self.analysis_text = "AI: 혼돈 상태, 패턴 분석 중..."
-                return
+
+            self.phase_turn = 0
+            self.phase_fails = 0
+            self.analysis_text = f"AI: '{plan_meta}' 상태, 계획 수립 완료"
         
         if self.prediction_plan:
             self.next_prediction = self.prediction_plan[self.phase_turn]
             self.should_bet_now = True
-            self.analysis_text = f"AI: 계획 {self.phase_turn + 1}/3 실행 중"
+            self.analysis_text = f"AI: 계획 {self.phase_turn + 1}/3 실행"
 
     def handle_input(self, r):
         if r == 'T':
@@ -163,15 +183,22 @@ class ConcordanceAI:
                 self.incorrect += 1; self.current_win = 0; self.current_loss += 1
                 self.max_loss = max(self.max_loss, self.current_loss)
                 self.popup_type = "miss"; self.hit_record.append("X")
+                self.phase_fails += 1
 
             self.popup_trigger = True
             self.phase_turn += 1
 
-            # 계획 종료 조건: 적중했거나, 3턴이 모두 끝났을 때
-            if is_hit or self.phase_turn >= len(self.prediction_plan):
+            plan_finished = self.phase_turn >= len(self.prediction_plan)
+            
+            if is_hit or plan_finished:
+                if is_hit:
+                    self.cooldown_turns = 2 # 적중 시 짧은 휴식
+                elif self.phase_fails >= 3:
+                    self.cooldown_turns = 4 # 3연패 시 긴 휴식
+                
                 self.prediction_plan = []
                 self.phase_turn = 0
-                self.cooldown_turns = 3
+                self.phase_fails = 0
         else:
             self.hit_record.append(None)
         
@@ -190,7 +217,7 @@ if 'stack' not in st.session_state: st.session_state.stack = []
 if 'prev_stats' not in st.session_state: st.session_state.prev_stats = {}
 pred = st.session_state.pred
 
-st.set_page_config(layout="wide", page_title="MetaRunner AI v6.0", page_icon="🧠")
+st.set_page_config(layout="wide", page_title="MetaRunner AI v8.0 Final", page_icon="🧠")
 st.markdown("""<style>
 html,body,[data-testid="stAppViewContainer"],[data-testid="stHeader"]{background:#0c111b!important;color:#e0fcff!important;}
 .stButton>button{border:none;border-radius:12px;padding:12px 24px;color:white;font-size:1.1em;font-weight:bold;transition:all .3s ease-out;}.stButton>button:hover{transform:translateY(-3px);filter:brightness(1.3);}
