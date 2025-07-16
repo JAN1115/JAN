@@ -68,10 +68,8 @@ class ConcordanceAI:
 
         self.cooldown_turns = 0
         
-        # --- 작전 계획 상태 변수 ---
         self.plan_step = 0
         self.plan_expert = None
-        self.plan_sequence = [] # <-- 3턴 예측을 저장할 리스트 추가
 
         self.analysis_text = "AI: 초기 데이터 수집 중..."
         self.popup_trigger, self.popup_type = False, None
@@ -135,22 +133,6 @@ class ConcordanceAI:
             reverse=True
         )
         return sorted_predictors[0]
-    
-    # <-- 3턴을 미리 예측하는 새 함수 ---
-    def _create_future_sequence(self, expert_to_use):
-        """선택된 전문가로 향후 3턴의 결과를 미리 시뮬레이션하여 리스트로 반환"""
-        temp_history = self.pb_history.copy()
-        sequence = []
-        for _ in range(3):
-            if len(temp_history) < 6: # 혹시 모를 경우 대비
-                pred = random.choice(['P', 'B'])
-            else:
-                all_preds = self._get_all_predictions(temp_history)
-                pred = all_preds[expert_to_use]
-            
-            sequence.append(pred)
-            temp_history.append(pred) # 예측 결과를 임시 히스토리에 추가하여 다음 예측에 반영
-        return sequence
 
     def process_next_turn(self):
         self.should_bet_now = False
@@ -162,31 +144,27 @@ class ConcordanceAI:
             return
 
         if self.cooldown_turns > 0:
-            self.analysis_text = f"AI: 분석중 ({self.cooldown_turns}턴 남음)."
+            self.analysis_text = f"AI: 분석중 ({self.cooldown_turns}턴 남음)." # <-- 문구 수정
             self.cooldown_turns -= 1
             return
         
-        # --- 새로운 작전 계획 로직 ---
         if self.plan_step == 0:
-            self.plan_expert = self._get_best_current_expert()
-            # 3턴 계획을 미리 생성
-            self.plan_sequence = self._create_future_sequence(self.plan_expert)
+            self.analysis_text = "AI: 새로운 작전 계획 수립 대기 중..."
             self.plan_step = 1
+            self.plan_expert = self._get_best_current_expert()
         
-        if 1 <= self.plan_step <= 3: # 1~3턴: 일관성 단계 (미리 생성된 계획 실행)
-            # 미리 생성된 계획에서 이번 턴의 예측을 가져옴
-            self.next_prediction = self.plan_sequence[self.plan_step - 1]
-            plan_str = "-".join(self.plan_sequence)
-            self.analysis_text = f"AI: [일관성 단계 {self.plan_step}/3] 계획: [{plan_str}]"
-            predictor_to_use = self.plan_expert # 통계 기록을 위해 전문가 이름은 유지
-        elif 4 <= self.plan_step <= 6: # 4~6턴: 적응 단계
+        all_preds = self._get_all_predictions(self.pb_history)
+        
+        if 1 <= self.plan_step <= 3:
+            predictor_to_use = self.plan_expert
+            self.analysis_text = f"AI: [일관성 단계 {self.plan_step}/3] 전문가 '{predictor_to_use.upper()}'"
+        elif 4 <= self.plan_step <= 6:
             predictor_to_use = self._get_best_current_expert()
-            all_preds = self._get_all_predictions(self.pb_history)
-            self.next_prediction = all_preds[predictor_to_use]
             self.analysis_text = f"AI: [적응 단계 {self.plan_step-3}/3] 전문가 '{predictor_to_use.upper()}'"
         else:
             return
 
+        self.next_prediction = all_preds[predictor_to_use]
         self.should_bet_now = True
         self.analysis_text += f" ({self.next_prediction} 예측)"
 
@@ -220,7 +198,6 @@ class ConcordanceAI:
                 self.cooldown_turns = 2
                 self.plan_step = 0
                 self.plan_expert = None
-                self.plan_sequence = [] # 계획 초기화
             else:
                 self.incorrect += 1; self.current_win = 0; self.current_loss += 1
                 self.max_loss = max(self.max_loss, self.current_loss)
@@ -231,7 +208,6 @@ class ConcordanceAI:
                     self.cooldown_turns = 4
                     self.plan_step = 0
                     self.plan_expert = None
-                    self.plan_sequence = [] # 계획 초기화
 
             self.popup_trigger = True
         else:
@@ -245,7 +221,7 @@ class ConcordanceAI:
         return {'총입력':len(self.history),'적중률(%)':round(self.correct/self.bet_count*100,2) if self.bet_count else 0,'현재연승':self.current_win,'최대연승':self.max_win,'현재연패':self.current_loss,'최대연패':self.max_loss}
 
 
-# ========== UI 파트 (이하 변경 없음) ==========
+# ========== UI 파트 ==========
 if 'pred' not in st.session_state: 
     st.session_state.pred = ConcordanceAI()
     st.session_state.pred.process_next_turn()
@@ -253,14 +229,17 @@ if 'stack' not in st.session_state: st.session_state.stack = []
 if 'prev_stats' not in st.session_state: st.session_state.prev_stats = {}
 pred = st.session_state.pred
 
-st.set_page_config(layout="wide", page_title="3+3 Hybrid AI", page_icon="🧬")
+st.set_page_config(layout="wide", page_title="JAN Hybrid AI 1.15v", page_icon="🧬")
 
+# --- UI Customization ---
 st.markdown("""
 <style>
+/* --- 기본 배경 및 폰트 --- */
 html, body, [data-testid="stAppViewContainer"], [data-testid="stHeader"] {
     background: #0c111b !important;
     color: #e0fcff !important;
 }
+/* --- 버튼 스타일 --- */
 .stButton>button {
     border: none;
     border-radius: 12px;
@@ -277,6 +256,8 @@ html, body, [data-testid="stAppViewContainer"], [data-testid="stHeader"] {
 div[data-testid="stHorizontalBlock"]>div:nth-child(1) .stButton>button { background: #0c3483; box-shadow: 0 0 8px #3b82f6, 0 0 12px #3b82f6; }
 div[data-testid="stHorizontalBlock"]>div:nth-child(2) .stButton>button { background: #880e4f; box-shadow: 0 0 8px #f06292, 0 0 12px #f06292; }
 div[data-testid="stHorizontalBlock"]>div:nth-child(3) .stButton>button { background: #1b5e20; box-shadow: 0 0 8px #4caf50, 0 0 12px #4caf50; }
+
+/* --- 상단 고정 스탯 바 --- */
 .top-stats-grid {
     display: grid;
     grid-template-columns: repeat(4, 1fr);
@@ -302,6 +283,7 @@ div[data-testid="stHorizontalBlock"]>div:nth-child(3) .stButton>button { backgro
     font-weight: bold;
     color: #e0fcff;
 }
+/* --- 스탯 변경 시 네온 애니메이션 --- */
 .stat-changed-neon {
     animation: neon-flash 1s ease-in-out;
 }
@@ -312,6 +294,7 @@ div[data-testid="stHorizontalBlock"]>div:nth-child(3) .stButton>button { backgro
         transform: scale(1.03);
     }
 }
+/* --- 연승/연패 아이콘 및 애니메이션 --- */
 .fire-animation {
     display: inline-block;
     animation: fire-burn 1.2s infinite ease-in-out;
@@ -331,8 +314,11 @@ div[data-testid="stHorizontalBlock"]>div:nth-child(3) .stButton>button { backgro
     25% { transform: translateY(1px) rotate(-3deg); }
     75% { transform: translateY(-1px) rotate(3deg); }
 }
+
+/* --- AI 예측 및 대기 UI --- */
 .next-prediction-box { font-size: 1.8em; font-weight: bold; color: #00fffa!important; animation: prediction-pop-in .5s ease-out; }
 @keyframes prediction-pop-in { 0%{transform:scale(.5);opacity:0} 100%{transform:scale(1);opacity:1} }
+
 .ai-waiting-bar {
     background: linear-gradient(90deg, rgba(43,41,0,0.6) 0%, rgba(80,70,0,0.9) 50%, rgba(43,41,0,0.6) 100%);
     border-radius: 10px;
@@ -346,19 +332,25 @@ div[data-testid="stHorizontalBlock"]>div:nth-child(3) .stButton>button { backgro
 }
 .rotating-hourglass { display: inline-block; animation: rotate 2s linear infinite; }
 @keyframes rotate { from{transform:rotate(0deg)} to{transform:rotate(360deg)} }
+
+/* --- 적중/미적중 팝업 --- */
 .top-notification { text-align:center; font-weight:bold; color:white; padding:8px; margin:-10px -10px 10px -10px; border-radius:8px; animation:slide-in-out 2.5s ease-in-out forwards; }
 .top-notification.hit { background: linear-gradient(90deg, #28a745, #1f8336); }
 .top-notification.miss { background: linear-gradient(90deg, #dc3545, #b32a38); }
 @keyframes slide-in-out { 0%{transform:translateY(-100%);opacity:0} 15%{transform:translateY(0);opacity:1} 85%{transform:translateY(0);opacity:1} 100%{transform:translateY(-100%);opacity:0} }
+
+/* --- 6매 기록 --- */
 .sixgrid-symbol{ border-radius:50%; font-weight:bold; padding:1.5px 7px; display:inline-block; }
 .sixgrid-fluo{ color:#d4ffb3; background:rgba(100,255,110,.25); }
 .sixgrid-miss{ color:#ffb3b3; background:rgba(255,100,110,.25); }
-.latest-result-pop { animation: pop-in 0.6s ease-out; }
+.latest-result-pop { animation: pop-in 0.6s ease-out; } /* <-- 6매 기록 애니메이션 */
 @keyframes pop-in {
     0% { transform: scale(0.5); }
     50% { transform: scale(1.4); }
     100% { transform: scale(1.0); }
 }
+
+/* --- 모바일 반응형 --- */
 @media (max-width: 768px) {
     .stButton>button { padding: 10px 18px; font-size: 1.0em; }
     .next-prediction-box { font-size: 1.5em; }
@@ -367,10 +359,13 @@ div[data-testid="stHorizontalBlock"]>div:nth-child(3) .stButton>button { backgro
 </style>
 """, unsafe_allow_html=True)
 
+# --- 상단 고정 스탯 바 ---
 s = pred.get_stats()
 prev_s = st.session_state.prev_stats
+
 win_anim_class = "stat-changed-neon" if s['현재연승'] > 0 and s['현재연승'] != prev_s.get('현재연승', 0) else ""
 loss_anim_class = "stat-changed-neon" if s['현재연패'] > 0 and s['현재연패'] != prev_s.get('현재연패', 0) else ""
+
 win_icon = f"<span class='fire-animation'>🔥</span>" if s['현재연승'] > 0 else "⚪"
 loss_icon = f"<span class='skull-animation'>💀</span>" if s['현재연패'] > 0 else "⚪"
 
@@ -396,6 +391,7 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 st.session_state.prev_stats = s.copy()
 
+
 if pred.popup_trigger:
     result_class = "hit" if pred.popup_type == "hit" else "miss"
     result_text = "🎉 적중!" if pred.popup_type == "hit" else "💥 미적중!"
@@ -409,12 +405,13 @@ if should_bet and npred:
     ICONS = {'P':'🔵','B':'🔴'}
     st.markdown(f'<div style="text-align:center;margin:5px 0 15px 0;"><span class="next-prediction-box">NEXT {ICONS[npred]}</span></div>', unsafe_allow_html=True)
 else:
-    st.markdown(f'<div class="ai-waiting-bar"><span class="rotating-hourglass">⏳</span> AI 대기중...</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="ai-waiting-bar"><span class="rotating-hourglass">⏳</span> AI 분석중...</div>', unsafe_allow_html=True)
 
 def handle_click(result):
     if 'stack' not in st.session_state: st.session_state.stack = []
     st.session_state.stack.append(copy.deepcopy(st.session_state.pred))
     st.session_state.pred.handle_input(result)
+    # st.rerun() # <-- No-op 오류를 막기 위해 제거
 
 button_cols = st.columns([1,1,1,0.5,0.5])
 button_cols[0].button("플레이어 (P)", use_container_width=True, on_click=handle_click, args=("P",))
@@ -449,6 +446,7 @@ for r in range(max_row):
                 if hitrec[idx] == "O": color_class = "sixgrid-fluo"
                 elif hitrec[idx] == "X": color_class = "sixgrid-miss"
             
+            # 마지막 결과에 애니메이션 클래스 추가
             anim_class = "latest-result-pop" if idx == len(history) - 1 else ""
             cell_content = f'<span class="sixgrid-symbol {color_class} {anim_class}">{val}</span>'
             
@@ -457,6 +455,7 @@ for r in range(max_row):
 six_html += '</tbody></table>'
 st.markdown(six_html, unsafe_allow_html=True)
 
+# --- 알고리즘 성과 보기 (맨 아래로 이동) ---
 st.markdown('<hr style="border:1px solid #222; margin: 25px 0 15px 0;">', unsafe_allow_html=True)
 with st.expander("📈 알고리즘 전체 성과 보기"):
     predictor_labels = list(pred.predictor_stats.keys())
