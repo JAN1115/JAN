@@ -1,6 +1,6 @@
 import streamlit as st
 import random, copy, time
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 
 # ---------- 알고리즘 유틸리티 함수 (클래스 외부) ----------
 def get_4_china_scores(pb_history):
@@ -67,10 +67,12 @@ class ConcordanceAI:
         self.contextual_stats = defaultdict(lambda: defaultdict(lambda: {'hits': 0, 'bets': 0}))
 
         self.cooldown_turns = 0
+        self.plan_step = 0
         
-        # --- 2-2-2 단계별 추론 알고리즘을 위한 상태 변수 ---
-        self.plan_step = 0  # 1~6까지의 연패 횟수 및 작전 단계를 추적
-        
+        # --- 내부 경쟁 모델을 위한 상태 변수 ---
+        self.strategies = ['main', 'ngram_pure', 'china_pure', 'trend_pure']
+        self.recent_performance = {s: deque(maxlen=20) for s in self.strategies} # 최근 20턴 성과 기록
+
         self.analysis_text = "AI: 초기 데이터 수집 중..."
         self.popup_trigger, self.popup_type = False, None
         self.next_prediction, self.should_bet_now = None, False
@@ -92,8 +94,7 @@ class ConcordanceAI:
         if len(pure) < 6: return {k: random.choice(['P','B']) for k in self.predictor_stats.keys()}
         preds = {}
         key = tuple(pure[-3:])
-        # 슬라이싱 범위를 확인하여 IndexError 방지
-        c = Counter(p for i in range(len(pure) - 3) if tuple(pure[i:i+3]) == key and i + 3 < len(pure) and (p := pure[i+3]))
+        c = Counter(p for i in range(len(pure) - 3) if tuple(pure[i:i+3]) == key and i + 3 < len(pure) and (p:=pure[i+3]))
         preds['ngram'] = c.most_common(1)[0][0] if c else random.choice(['P', 'B'])
         cnt = Counter(pure[-4:])
         preds['trend'] = 'P' if cnt['P'] > cnt['B'] else ('B' if cnt['B'] > cnt['P'] else random.choice(['P','B']))
@@ -109,47 +110,28 @@ class ConcordanceAI:
     def _analyze_meta_with_scores(self, pb_history):
         pure = [x for x in pb_history if x in 'PB']
         if len(pure) < 6: return "혼돈", 0
-        last6_str = "".join(pure[-6:])
-        last8_str = "".join(pure[-8:]) if len(pure) >= 8 else ""
-
-        streak_score = 0
-        if last6_str[-4:] in ("PPPP", "BBBB"): streak_score = 80
-        elif last6_str[-3:] in ("PPP", "BBB"): streak_score = 60
-        zigzag_score = 0
-        if last6_str == "PBPBPB" or last6_str == "BPBPBP": zigzag_score = 90
-        elif last6_str.endswith("PBPB") or last6_str.endswith("BPBP"): zigzag_score = 70
-        two_two_score = 0
-        if last8_str.endswith("PPBBPPBB") or last8_str.endswith("BBPPBBPP"): two_two_score = 85
-        elif last6_str.endswith("PPBB") or last6_str.endswith("BBPP"): two_two_score = 75
-        two_one_score = 0
-        if last6_str in ("PPBPPB", "BBPBBP"): two_one_score = 80
-        elif last6_str.endswith("PPB") or last6_str.endswith("BBP"): two_one_score = 65
-        
-        scores = {"장줄": streak_score, "퐁당퐁당": zigzag_score, "투투": two_two_score, "투원": two_one_score}
-        CONFIDENCE_THRESHOLD = 65
-        positive_scores = {name: score for name, score in scores.items() if score > 0}
-        
+        last6_str, last8_str = "".join(pure[-6:]), "".join(pure[-8:]) if len(pure) >= 8 else ""
+        scores = {
+            "장줄": 80 if last6_str[-4:] in ("PPPP", "BBBB") else (60 if last6_str[-3:] in ("PPP", "BBB") else 0),
+            "퐁당퐁당": 90 if last6_str in ("PBPBPB", "BPBPBP") else (70 if last6_str.endswith(("PBPB", "BPBP")) else 0),
+            "투투": 85 if last8_str.endswith(("PPBBPPBB", "BBPPBBPP")) else (75 if last6_str.endswith(("PPBB", "BBPP")) else 0),
+            "투원": 80 if last6_str in ("PPBPPB", "BBPBBP") else (65 if last6_str.endswith(("PPB", "BBP")) else 0)
+        }
+        positive_scores = {k: v for k, v in scores.items() if v > 0}
         if not positive_scores: return "혼돈", 0
-        best_pattern_name = max(positive_scores, key=positive_scores.get)
-        best_score = positive_scores[best_pattern_name]
-        
-        if best_score >= CONFIDENCE_THRESHOLD: return best_pattern_name, best_score
-        else: return "혼돈", 0
+        best_pattern = max(positive_scores, key=positive_scores.get)
+        return (best_pattern, positive_scores[best_pattern]) if positive_scores[best_pattern] >= 65 else ("혼돈", 0)
 
     def _get_best_current_expert(self):
+        # ... (이전과 동일)
         current_context = self._get_current_context(self.pb_history)
         context_specific_stats = self.contextual_stats[current_context]
         def get_contextual_hit_rate(predictor_key):
             stats = context_specific_stats.get(predictor_key)
             if stats and stats['bets'] > 3: return stats['hits'] / stats['bets']
             return -1
-        sorted_predictors = sorted(
-            self.predictor_stats.keys(),
-            key=lambda k: (get_contextual_hit_rate(k), self.predictor_stats[k]['hits'] / self.predictor_stats[k]['bets'] if self.predictor_stats[k]['bets'] > 0 else 0),
-            reverse=True)
-        return sorted_predictors[0]
+        return sorted(self.predictor_stats.keys(), key=lambda k: (get_contextual_hit_rate(k), self.predictor_stats[k]['hits'] / self.predictor_stats[k]['bets'] if self.predictor_stats[k]['bets'] > 0 else 0), reverse=True)[0]
 
-    # --- 여기가 새로운 '2-2-2 단계별 추론' 알고리즘의 핵심 ---
     def process_next_turn(self):
         self.should_bet_now = False
         self.next_prediction = None
@@ -165,112 +147,102 @@ class ConcordanceAI:
             return
         
         if self.plan_step == 0:
-            self.analysis_text = "AI: 새로운 작전 계획 수립 대기 중..."
-            self.plan_step = 1 # 작전 시작
-        
-        # 2-2-2 단계별 추론 로직
-        phase_1_prediction = None
-        phase_2_prediction = None
-        phase_3_prediction = None
-        
-        if 1 <= self.plan_step <= 2: # 1단계: 기준점 예측
+            self.plan_step = 1
+
+        # --- 1. 메인 전략(2-2-2)에 따른 기본 예측 생성 ---
+        default_prediction = None
+        if 1 <= self.plan_step <= 2:
             last_val = self.pb_history[-1]
-            # 이어지거나(P>P) 꺾이는(P>B) 두 가지 시나리오 예측
-            pred1 = last_val 
-            pred2 = 'B' if last_val == 'P' else 'P'
-            phase_1_prediction = [pred1, pred2] # [연속, 전환]
-            self.next_prediction = phase_1_prediction[self.plan_step - 1] # 1턴째는 연속, 2턴째는 전환 시도
-            self.analysis_text = f"AI: [1단계-기준점 분석 {self.plan_step}/2] 직전 값 '{last_val}'에 대한 반응 예측"
-
-        elif 3 <= self.plan_step <= 4: # 2단계: 패턴 분석 예측
-            # 표준적인 최고 전문가 분석을 통해 2턴 예측
+            default_prediction = last_val if self.plan_step == 1 else ('B' if last_val == 'P' else 'P')
+            self.analysis_text = f"AI: [1단계-기준점 {self.plan_step}/2] 분석 중..."
+        elif 3 <= self.plan_step <= 4:
             expert = self._get_best_current_expert()
-            meta, _ = self._analyze_meta_with_scores(self.pb_history)
-            
-            # 2턴 예측 (간단한 방식: 같은 전문가가 2번 예측)
-            temp_history = self.pb_history.copy()
-            pred1_map = self._get_all_predictions(temp_history)
-            pred1 = pred1_map[expert]
-            temp_history.append(pred1)
-            pred2_map = self._get_all_predictions(temp_history)
-            pred2 = pred2_map[expert]
-            
-            phase_2_prediction = [pred1, pred2]
-            self.next_prediction = phase_2_prediction[self.plan_step - 3]
-            self.analysis_text = f"AI: [2단계-패턴 분석 {self.plan_step-2}/2] '{meta}' 패턴 기반 예측"
+            all_preds = self._get_all_predictions(self.pb_history)
+            default_prediction = all_preds[expert]
+            self.analysis_text = f"AI: [2단계-패턴분석 {self.plan_step-2}/2] 분석 중..."
+        elif 5 <= self.plan_step <= 6:
+            all_preds = self._get_all_predictions(self.pb_history)
+            default_prediction = all_preds['china'] if self.plan_step == 5 else ('B' if all_preds['trend'] == 'P' else 'P')
+            self.analysis_text = f"AI: [3단계-오차보정 {self.plan_step-4}/2] 분석 중..."
 
-        elif 5 <= self.plan_step <= 6: # 3단계: 오차 보정 예측
-            self.analysis_text = f"AI: [3단계-오차 보정 {self.plan_step-4}/2] 이전 실패 원인 분석 중..."
-            # 실제 구현에서는 과거 예측 기록과 결과를 비교하여 오차를 추론하는 복잡한 로직이 필요.
-            # 여기서는 가장 안정적인 'china' 로드와 '반대 베팅'을 조합하는 방어적 로직으로 구현.
-            china_pred = self._get_all_predictions(self.pb_history)['china']
-            trend_pred = self._get_all_predictions(self.pb_history)['trend']
-            opposite_pred = 'B' if trend_pred == 'P' else 'P'
+        # --- 2. 내부 경쟁을 통해 '챔피언' 전략 결정 ---
+        all_raw_preds = self._get_all_predictions(self.pb_history)
+        strategy_preds = {
+            'main': default_prediction,
+            'ngram_pure': all_raw_preds['ngram'],
+            'china_pure': all_raw_preds['china'],
+            'trend_pure': all_raw_preds['trend']
+        }
+
+        champion = 'main' # 기본값
+        # 충분한 데이터가 쌓인 후 경쟁 시작
+        if len(self.recent_performance['main']) == self.recent_performance['main'].maxlen:
+            strategy_hit_rates = {s: (sum(p) / len(p) if p else 0) for s, p in self.recent_performance.items()}
+            champion = max(strategy_hit_rates, key=strategy_hit_rates.get)
             
-            phase_3_prediction = [china_pred, opposite_pred] # [안정 예측, 역추세 예측]
-            self.next_prediction = phase_3_prediction[self.plan_step - 5]
-            self.analysis_text = f"AI: [3단계-오차 보정 {self.plan_step-4}/2] 방어적 예측 실행"
+            # 분석 텍스트 업데이트
+            champion_name_map = {
+                'main': '단계별 추론', 'ngram_pure': 'N-그램',
+                'china_pure': '중국점', 'trend_pure': '트렌드'
+            }
+            self.analysis_text += f" [내부경쟁: '{champion_name_map[champion]}' 우세]"
 
-        else:
-            return
-
+        # --- 3. 챔피언 전략의 예측을 최종 선택 ---
+        self.next_prediction = strategy_preds[champion]
         self.should_bet_now = True
         self.analysis_text += f" ({self.next_prediction} 예측)"
-    # --- 여기까지 새로운 알고리즘 ---
 
     def handle_input(self, r):
-        # 학습 로직: 모든 결과에 대해 각 전문가의 성과를 기록
-        if len(self.pb_history) >= 6:
-            context_before_result = self._get_current_context(self.pb_history)
-            all_preds = self._get_all_predictions(self.pb_history)
-            for key, pred_val in all_preds.items():
+        if r in 'PB' and len(self.pb_history) >= 6:
+            # --- 내부 경쟁 모델 학습 ---
+            # 1. 메인 전략의 예측 기록 (베팅 했을 경우)
+            if self.should_bet_now:
+                self.recent_performance['main'].append(1 if self.next_prediction == r else 0)
+            # 2. 그림자 전략들의 예측 기록
+            all_raw_preds = self._get_all_predictions(self.pb_history)
+            self.recent_performance['ngram_pure'].append(1 if all_raw_preds['ngram'] == r else 0)
+            self.recent_performance['china_pure'].append(1 if all_raw_preds['china'] == r else 0)
+            self.recent_performance['trend_pure'].append(1 if all_raw_preds['trend'] == r else 0)
+            
+            # --- 기본 학습 로직 ---
+            context = self._get_current_context(self.pb_history)
+            for key, pred_val in all_raw_preds.items():
                 self.predictor_stats[key]['bets'] += 1
-                self.contextual_stats[context_before_result][key]['bets'] += 1
+                self.contextual_stats[context][key]['bets'] += 1
                 if pred_val == r:
                     self.predictor_stats[key]['hits'] += 1
-                    self.contextual_stats[context_before_result][key]['hits'] += 1
+                    self.contextual_stats[context][key]['hits'] += 1
         
-        # 타이(Tie) 결과 처리
         if r == 'T':
-            self.history.append(r)
-            self.hit_record.append(None)
+            self.history.append(r); self.hit_record.append(None)
             self.process_next_turn()
             return
 
-        # 베팅 실행 로직
         if self.should_bet_now:
-            self.bet_count += 1
             is_hit = (self.next_prediction == r)
+            self.bet_count += 1
             self.hit_record.append("O" if is_hit else "X")
             
             if is_hit:
                 self.correct += 1; self.current_win += 1; self.current_loss = 0
                 self.max_win = max(self.max_win, self.current_win)
-                self.popup_type = "hit"
-                self.cooldown_turns = 2 # 성공 시 휴식
-                self.plan_step = 0 # 작전 계획 초기화
-            else: # 미적중
+                self.popup_type, self.cooldown_turns, self.plan_step = "hit", 2, 0
+            else:
                 self.incorrect += 1; self.current_win = 0; self.current_loss += 1
                 self.max_loss = max(self.max_loss, self.current_loss)
                 self.popup_type = "miss"
-                self.plan_step += 1 # 다음 작전 단계로 이동
-
-                if self.plan_step > 6: # 6연패 시
-                    self.cooldown_turns = 4 # 긴 휴식
-                    self.plan_step = 0 # 작전 계획 초기화
-
+                self.plan_step = (self.plan_step + 1) % 7
+                if self.plan_step == 0: self.cooldown_turns = 4
             self.popup_trigger = True
         else:
             self.hit_record.append(None)
         
-        # 기록 업데이트 및 다음 턴 준비
         self.history.append(r)
         if r in 'PB': self.pb_history.append(r)
         self.process_next_turn()
 
     def get_stats(self):
         return {'총입력':len(self.history),'적중률(%)':round(self.correct/self.bet_count*100,2) if self.bet_count else 0,'현재연승':self.current_win,'최대연승':self.max_win,'현재연패':self.current_loss,'최대연패':self.max_loss}
-
 
 # ========== UI 파트 (변경 없음) ==========
 if 'pred' not in st.session_state:
@@ -280,8 +252,9 @@ if 'stack' not in st.session_state: st.session_state.stack = []
 if 'prev_stats' not in st.session_state: st.session_state.prev_stats = {}
 pred = st.session_state.pred
 
-st.set_page_config(layout="wide", page_title="JAN Hybrid AI 2.0 (Phased)", page_icon="🧠")
+st.set_page_config(layout="wide", page_title="JAN Hybrid AI 3.0 (Evolving)", page_icon="💡")
 
+# --- UI Customization ---
 st.markdown("""
 <style>
 /* --- (스타일 코드는 이전과 동일하여 생략) --- */
