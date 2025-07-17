@@ -2,143 +2,62 @@ import streamlit as st
 import random, copy, time
 from collections import Counter, defaultdict, deque
 
-# ---------- 알고리즘 유틸리티 함수 (클래스 외부) ----------
-def get_4_china_scores(pb_history):
-    def calc_big_road(pb_history):
-        grid = defaultdict(lambda: defaultdict(str))
-        row = col = 0
-        prev = None
-        drop_col = 0
-        for r in pb_history:
-            if r not in 'PB': continue
-            if prev is None or r == prev:
-                if prev is not None: row += 1
-                grid[row][col] = r
-            else:
-                drop_col += 1
-                col = drop_col
-                row = 0
-                grid[row][col] = r
-            prev = r
-        return grid
-    def extract_col(grid, col_idx):
-        return [grid[row].get(col_idx,'') for row in range(50)]
-    def calc_china_roads(bigroad, mode):
-        score = 0
-        col_offset = {1:1, 2:2, 3:3}[mode]
-        for col in range(col_offset, 100):
-            cur_col = extract_col(bigroad, col)
-            ref_col = extract_col(bigroad, col-col_offset)
-            if not cur_col[0]: break
-            if len([x for x in cur_col if x]) == len([x for x in ref_col if x]):
-                score += 1
-            else:
-                score -= 1
-        return score
-    bigroad = calc_big_road(pb_history)
-    scores = {}
-    streaks = 0
-    last = None
-    pure_pb = [r for r in pb_history if r in 'PB']
-    if pure_pb:
-        last = pure_pb[-1]
-        for r in reversed(pure_pb):
-            if r == last:
-                streaks += 1
-            else:
-                break
-    scores['빅로드'] = streaks
-    scores['빅아이'] = calc_china_roads(bigroad, 1)
-    scores['스몰로드'] = calc_china_roads(bigroad, 2)
-    scores['바퀴'] = calc_china_roads(bigroad, 3)
-    return scores
-
-# ---------- '최종 지능형' AI 클래스 ----------
+# ---------- AI 클래스 및 유틸리티 함수 ----------
 class ConcordanceAI:
     def __init__(self):
         self.history, self.pb_history, self.hit_record = [], [], []
         self.bet_count, self.correct, self.incorrect = 0, 0, 0
         self.current_win, self.current_loss, self.max_win, self.max_loss = 0, 0, 0, 0
-
-        self.predictor_stats = {
-            'ngram': {'hits': 0, 'bets': 0}, 'trend': {'hits': 0, 'bets': 0},
-            'china': {'hits': 0, 'bets': 0}, 'combo': {'hits': 0, 'bets': 0}
-        }
-        self.contextual_stats = defaultdict(lambda: defaultdict(lambda: {'hits': 0, 'bets': 0}))
-
         self.cooldown_turns = 0
-        self.plan_step = 0
         
-        # --- 내부 경쟁 모델을 위한 상태 변수 ---
-        self.strategies = ['main', 'ngram_pure', 'china_pure', 'trend_pure']
-        self.recent_performance = {s: deque(maxlen=20) for s in self.strategies} # 최근 20턴 성과 기록
+        # --- 새로운 통합 경쟁 모델 ---
+        self.strategies = ['ngram_3', 'ngram_4', 'ngram_5', 'china_pure', 'trend_pure']
+        self.recent_performance = {s: deque(maxlen=20) for s in self.strategies}
+        self.ngram_counts = {3: defaultdict(Counter), 4: defaultdict(Counter), 5: defaultdict(Counter)}
 
         self.analysis_text = "AI: 초기 데이터 수집 중..."
-        self.popup_trigger, self.popup_type = False, None
         self.next_prediction, self.should_bet_now = None, False
+        self.popup_trigger, self.popup_type = False, None
 
-    def _get_current_context(self, history):
-        pure_hist = [x for x in history if x in 'PB']
-        if len(pure_hist) < 6: return ('초기', 0)
-        meta, _ = self._analyze_meta_with_scores(pure_hist)
-        streak = 0
-        if pure_hist:
-            last_val = pure_hist[-1]
-            for val in reversed(pure_hist):
-                if val == last_val: streak += 1
-                else: break
-        return (meta, streak)
-
-    def _get_all_predictions(self, pb_history):
+    def _get_legacy_predictions(self, pb_history):
         pure = [x for x in pb_history if x in 'PB']
-        if len(pure) < 6: return {k: random.choice(['P','B']) for k in self.predictor_stats.keys()}
+        if len(pure) < 6: return {k: random.choice(['P','B']) for k in ['china', 'trend']}
         preds = {}
-        key = tuple(pure[-3:])
-        c = Counter(p for i in range(len(pure) - 3) if tuple(pure[i:i+3]) == key and i + 3 < len(pure) and (p:=pure[i+3]))
-        preds['ngram'] = c.most_common(1)[0][0] if c else random.choice(['P', 'B'])
         cnt = Counter(pure[-4:])
         preds['trend'] = 'P' if cnt['P'] > cnt['B'] else ('B' if cnt['B'] > cnt['P'] else random.choice(['P','B']))
-        scores = get_4_china_scores(pb_history)
-        china_preds = ['P' if score % 2 == 0 else 'B' for score in scores.values()]
-        preds['china'] = Counter(china_preds).most_common(1)[0][0]
-        pattern = "".join(pure[-6:])
-        if pattern in ["PPPPPP", "BBBBBB"]: preds['combo'] = pure[-1]
-        elif pattern in ["PBPBPB", "BPBPBP"]: preds['combo'] = pure[-2]
-        else: preds['combo'] = random.choice(['P', 'B'])
+        preds['china'] = random.choice(['P','B']) # Placeholder
         return preds
 
-    def _analyze_meta_with_scores(self, pb_history):
-        pure = [x for x in pb_history if x in 'PB']
-        if len(pure) < 6: return "혼돈", 0
-        last6_str, last8_str = "".join(pure[-6:]), "".join(pure[-8:]) if len(pure) >= 8 else ""
-        scores = {
-            "장줄": 80 if last6_str[-4:] in ("PPPP", "BBBB") else (60 if last6_str[-3:] in ("PPP", "BBB") else 0),
-            "퐁당퐁당": 90 if last6_str in ("PBPBPB", "BPBPBP") else (70 if last6_str.endswith(("PBPB", "BPBP")) else 0),
-            "투투": 85 if last8_str.endswith(("PPBBPPBB", "BBPPBBPP")) else (75 if last6_str.endswith(("PPBB", "BBPP")) else 0),
-            "투원": 80 if last6_str in ("PPBPPB", "BBPBBP") else (65 if last6_str.endswith(("PPB", "BBP")) else 0)
-        }
-        positive_scores = {k: v for k, v in scores.items() if v > 0}
-        if not positive_scores: return "혼돈", 0
-        best_pattern = max(positive_scores, key=positive_scores.get)
-        return (best_pattern, positive_scores[best_pattern]) if positive_scores[best_pattern] >= 65 else ("혼돈", 0)
+    def _get_ngram_prediction(self, history, n):
+        if len(history) < n - 1: return random.choice(['P', 'B'])
+        key = tuple(history[-(n-1):])
+        counter = self.ngram_counts[n].get(key, None)
+        if not counter: return random.choice(['P', 'B'])
+        return max(counter, key=counter.get)
 
-    def _get_best_current_expert(self):
-        # ... (이전과 동일)
-        current_context = self._get_current_context(self.pb_history)
-        context_specific_stats = self.contextual_stats[current_context]
-        def get_contextual_hit_rate(predictor_key):
-            stats = context_specific_stats.get(predictor_key)
-            if stats and stats['bets'] > 3: return stats['hits'] / stats['bets']
-            return -1
-        return sorted(self.predictor_stats.keys(), key=lambda k: (get_contextual_hit_rate(k), self.predictor_stats[k]['hits'] / self.predictor_stats[k]['bets'] if self.predictor_stats[k]['bets'] > 0 else 0), reverse=True)[0]
+    def _analyze_meta_clarity(self):
+        pure = [x for x in self.pb_history if x in 'PB']
+        if len(pure) < 6: return "혼돈"
+        last6_str = "".join(pure[-6:])
+        if last6_str.count(last6_str[0]) >= 5 or last6_str in ("PBPBPB", "BPBPBP"): return "선명함"
+        if "PPP" in last6_str or "BBB" in last6_str or "PBP" in last6_str or "BPB" in last6_str: return "보통"
+        return "혼돈"
+
+    def _calculate_skip_turns(self, on_win):
+        clarity = self._analyze_meta_clarity()
+        if on_win: # 적중 시 1~2턴 스킵
+            if clarity == "선명함": return 1
+            return 2
+        else: # 3연패 이상 시 3~4턴 스킵
+            if clarity == "혼돈": return 4
+            return 3
 
     def process_next_turn(self):
         self.should_bet_now = False
         self.next_prediction = None
-        self.popup_trigger = False
 
         if len(self.pb_history) < 10:
-            self.analysis_text = f"AI: 초기 데이터 수집 중... ({len(self.pb_history)}/10)"
+            self.analysis_text = f"AI: 초기 데이터 수집 중..."
             return
 
         if self.cooldown_turns > 0:
@@ -146,78 +65,51 @@ class ConcordanceAI:
             self.cooldown_turns -= 1
             return
         
-        if self.plan_step == 0:
-            self.plan_step = 1
-
-        # --- 1. 메인 전략(2-2-2)에 따른 기본 예측 생성 ---
-        default_prediction = None
-        if 1 <= self.plan_step <= 2:
-            last_val = self.pb_history[-1]
-            default_prediction = last_val if self.plan_step == 1 else ('B' if last_val == 'P' else 'P')
-            self.analysis_text = f"AI: [1단계-기준점 {self.plan_step}/2] 분석 중..."
-        elif 3 <= self.plan_step <= 4:
-            expert = self._get_best_current_expert()
-            all_preds = self._get_all_predictions(self.pb_history)
-            default_prediction = all_preds[expert]
-            self.analysis_text = f"AI: [2단계-패턴분석 {self.plan_step-2}/2] 분석 중..."
-        elif 5 <= self.plan_step <= 6:
-            all_preds = self._get_all_predictions(self.pb_history)
-            default_prediction = all_preds['china'] if self.plan_step == 5 else ('B' if all_preds['trend'] == 'P' else 'P')
-            self.analysis_text = f"AI: [3단계-오차보정 {self.plan_step-4}/2] 분석 중..."
-
-        # --- 2. 내부 경쟁을 통해 '챔피언' 전략 결정 ---
-        all_raw_preds = self._get_all_predictions(self.pb_history)
+        # --- 통합 경쟁을 통해 '챔피언' 전략 결정 ---
         strategy_preds = {
-            'main': default_prediction,
-            'ngram_pure': all_raw_preds['ngram'],
-            'china_pure': all_raw_preds['china'],
-            'trend_pure': all_raw_preds['trend']
+            'ngram_3': self._get_ngram_prediction(self.pb_history, 3),
+            'ngram_4': self._get_ngram_prediction(self.pb_history, 4),
+            'ngram_5': self._get_ngram_prediction(self.pb_history, 5),
+            'china_pure': self._get_legacy_predictions(self.pb_history)['china'],
+            'trend_pure': self._get_legacy_predictions(self.pb_history)['trend'],
         }
-
-        champion = 'main' # 기본값
-        # 충분한 데이터가 쌓인 후 경쟁 시작
-        if len(self.recent_performance['main']) == self.recent_performance['main'].maxlen:
-            strategy_hit_rates = {s: (sum(p) / len(p) if p else 0) for s, p in self.recent_performance.items()}
-            champion = max(strategy_hit_rates, key=strategy_hit_rates.get)
-            
-            # 분석 텍스트 업데이트
-            champion_name_map = {
-                'main': '단계별 추론', 'ngram_pure': 'N-그램',
-                'china_pure': '중국점', 'trend_pure': '트렌드'
-            }
-            self.analysis_text += f" [내부경쟁: '{champion_name_map[champion]}' 우세]"
-
-        # --- 3. 챔피언 전략의 예측을 최종 선택 ---
-        self.next_prediction = strategy_preds[champion]
+        
+        strategy_hit_rates = {s: (sum(p) / len(p) if p else 0) for s, p in self.recent_performance.items()}
+        champion = max(strategy_hit_rates, key=strategy_hit_rates.get)
+        
+        self.next_prediction = strategy_preds.get(champion, random.choice(['P', 'B']))
+        self.analysis_text = f"AI: [통합경쟁] '{champion}' 전략 선택 ({self.next_prediction} 예측)"
         self.should_bet_now = True
-        self.analysis_text += f" ({self.next_prediction} 예측)"
 
     def handle_input(self, r):
+        # 학습 로직
         if r in 'PB' and len(self.pb_history) >= 6:
-            # --- 내부 경쟁 모델 학습 ---
-            # 1. 메인 전략의 예측 기록 (베팅 했을 경우)
+            # 베팅이 실행될 예정이었다면, 모든 전략의 성과를 기록
             if self.should_bet_now:
-                self.recent_performance['main'].append(1 if self.next_prediction == r else 0)
-            # 2. 그림자 전략들의 예측 기록
-            all_raw_preds = self._get_all_predictions(self.pb_history)
-            self.recent_performance['ngram_pure'].append(1 if all_raw_preds['ngram'] == r else 0)
-            self.recent_performance['china_pure'].append(1 if all_raw_preds['china'] == r else 0)
-            self.recent_performance['trend_pure'].append(1 if all_raw_preds['trend'] == r else 0)
-            
-            # --- 기본 학습 로직 ---
-            context = self._get_current_context(self.pb_history)
-            for key, pred_val in all_raw_preds.items():
-                self.predictor_stats[key]['bets'] += 1
-                self.contextual_stats[context][key]['bets'] += 1
-                if pred_val == r:
-                    self.predictor_stats[key]['hits'] += 1
-                    self.contextual_stats[context][key]['hits'] += 1
+                # 베팅 전 시점의 기록으로 예측
+                history_before_bet = self.pb_history
+                preds_before_bet = {
+                    'ngram_3': self._get_ngram_prediction(history_before_bet, 3),
+                    'ngram_4': self._get_ngram_prediction(history_before_bet, 4),
+                    'ngram_5': self._get_ngram_prediction(history_before_bet, 5),
+                    'china_pure': self._get_legacy_predictions(history_before_bet)['china'],
+                    'trend_pure': self._get_legacy_predictions(history_before_bet)['trend'],
+                }
+                for s_name, s_pred in preds_before_bet.items():
+                    self.recent_performance[s_name].append(1 if s_pred == r else 0)
         
         if r == 'T':
-            self.history.append(r); self.hit_record.append(None)
-            self.process_next_turn()
+            self.history.append(r); self.hit_record.append(None); self.process_next_turn()
             return
 
+        # N-gram 카운트 업데이트
+        if r in 'PB':
+            temp_history = self.pb_history + [r]
+            if len(temp_history) >= 3: self.ngram_counts[3][tuple(temp_history[-3:-1])][temp_history[-1]] += 1
+            if len(temp_history) >= 4: self.ngram_counts[4][tuple(temp_history[-4:-1])][temp_history[-1]] += 1
+            if len(temp_history) >= 5: self.ngram_counts[5][tuple(temp_history[-5:-1])][temp_history[-1]] += 1
+
+        # 베팅 실행 및 결과 처리
         if self.should_bet_now:
             is_hit = (self.next_prediction == r)
             self.bet_count += 1
@@ -226,14 +118,14 @@ class ConcordanceAI:
             if is_hit:
                 self.correct += 1; self.current_win += 1; self.current_loss = 0
                 self.max_win = max(self.max_win, self.current_win)
-                self.popup_type, self.cooldown_turns, self.plan_step = "hit", 2, 0
+                self.cooldown_turns = self._calculate_skip_turns(on_win=True)
             else:
                 self.incorrect += 1; self.current_win = 0; self.current_loss += 1
                 self.max_loss = max(self.max_loss, self.current_loss)
-                self.popup_type = "miss"
-                self.plan_step = (self.plan_step + 1) % 7
-                if self.plan_step == 0: self.cooldown_turns = 4
-            self.popup_trigger = True
+                # 3연패 이상 시 스킵 발동
+                if self.current_loss >= 3:
+                    self.cooldown_turns = self._calculate_skip_turns(on_win=False)
+                    self.current_loss = 0 # 스킵 후 연패 기록 초기화
         else:
             self.hit_record.append(None)
         
@@ -244,6 +136,7 @@ class ConcordanceAI:
     def get_stats(self):
         return {'총입력':len(self.history),'적중률(%)':round(self.correct/self.bet_count*100,2) if self.bet_count else 0,'현재연승':self.current_win,'최대연승':self.max_win,'현재연패':self.current_loss,'최대연패':self.max_loss}
 
+
 # ========== UI 파트 (변경 없음) ==========
 if 'pred' not in st.session_state:
     st.session_state.pred = ConcordanceAI()
@@ -252,9 +145,8 @@ if 'stack' not in st.session_state: st.session_state.stack = []
 if 'prev_stats' not in st.session_state: st.session_state.prev_stats = {}
 pred = st.session_state.pred
 
-st.set_page_config(layout="wide", page_title="JAN Hybrid AI 3.0 (Evolving)", page_icon="💡")
+st.set_page_config(layout="wide", page_title="Unified Competition AI", page_icon="🏆")
 
-# --- UI Customization ---
 st.markdown("""
 <style>
 /* --- (스타일 코드는 이전과 동일하여 생략) --- */
@@ -381,13 +273,3 @@ for r in range(max_row):
     six_html += "</tr>"
 six_html += '</tbody></table>'
 st.markdown(six_html, unsafe_allow_html=True)
-
-st.markdown('<hr style="border:1px solid #222; margin: 25px 0 15px 0;">', unsafe_allow_html=True)
-with st.expander("📈 알고리즘 전체 성과 보기"):
-    predictor_labels = list(pred.predictor_stats.keys())
-    sub_cols = st.columns(len(predictor_labels))
-    for i, key in enumerate(predictor_labels):
-        stats = pred.predictor_stats[key]
-        rate = round(stats['hits'] / stats['bets'] * 100, 1) if stats['bets'] > 0 else 0
-        with sub_cols[i]:
-            st.metric(label=f"{key.upper()}", value=f"{rate}%", help=f"{stats['hits']} / {stats['bets']}")
