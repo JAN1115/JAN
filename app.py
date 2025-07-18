@@ -2,7 +2,7 @@ import streamlit as st
 import random, copy, time
 from collections import Counter, defaultdict, deque
 
-# ---------- AI 클래스 및 유틸리티 함수 (로직 수정) ----------
+# ---------- '최종 지능형' AI 클래스 ----------
 class ConcordanceAI:
     def __init__(self):
         self.history, self.pb_history, self.hit_record = [], [], []
@@ -10,125 +10,137 @@ class ConcordanceAI:
         self.current_win, self.current_loss, self.max_win, self.max_loss = 0, 0, 0, 0
         self.cooldown_turns = 0
         
-        # --- 새로운 6턴 주기 전략 상태 변수 ---
-        self.cycle_turn = 0 # 0~5까지 증가하며 6턴 주기를 추적
-        
-        # N-그램 학습 데이터 저장소
-        self.ngram_counts = {3: defaultdict(Counter), 4: defaultdict(Counter), 5: defaultdict(Counter)}
+        # --- 새로운 2단계 작전 계획 상태 변수 ---
+        self.plan_phase = 1  # 1: 챔피언, 2: 다수결
+        self.phase_attempt = 0 # 각 단계 내 시도 횟수 (0 또는 1)
+
+        # --- 내부 경쟁(앙상블)을 위한 전문가 리스트 ---
+        self.experts = ['ngram', 'china', 'trend', 'meta']
+        self.recent_performance = {s: deque(maxlen=20) for s in self.experts}
 
         self.analysis_text = "AI: 초기 데이터 수집 중..."
         self.next_prediction, self.should_bet_now = None, False
+        self.popup_trigger, self.popup_type = False, None
 
-    def _get_ngram_prediction(self, history, n):
-        """지정된 N-gram을 기반으로 예측을 반환하는 기본 함수"""
-        if len(history) < n - 1: return random.choice(['P', 'B'])
-        key = tuple(history[-(n-1):])
-        counter = self.ngram_counts[n].get(key, None)
-        if not counter: return random.choice(['P', 'B'])
-        return max(counter, key=counter.get)
-
-    def _get_combined_ngram_prediction(self):
-        """N-gram 3, 4, 5의 예측을 종합하여 다수결로 최종 예측 결정"""
-        preds = [
-            self._get_ngram_prediction(self.pb_history, 3),
-            self._get_ngram_prediction(self.pb_history, 4),
-            self._get_ngram_prediction(self.pb_history, 5)
-        ]
-        # 다수결로 가장 많이 나온 예측을 반환
-        return Counter(preds).most_common(1)[0][0]
-
-    def _analyze_meta_clarity(self):
-        """게임 흐름의 선명도를 분석 (스킵 턴 계산에 사용)"""
-        pure = [x for x in self.pb_history if x in 'PB']
-        if len(pure) < 6: return "혼돈"
+    def _analyze_meta_with_scores(self, pb_history):
+        pure = [x for x in pb_history if x in 'PB']
+        if len(pure) < 6: return "혼돈", 0
         last6_str = "".join(pure[-6:])
-        if last6_str.count(last6_str[0]) >= 5 or last6_str in ("PBPBPB", "BPBPBP"): return "선명함"
-        if "PPP" in last6_str or "BBB" in last6_str or "PBP" in last6_str or "BPB" in last6_str: return "보통"
-        return "혼돈"
+        scores = {"장줄": 80 if last6_str.count(last6_str[-1]) >= 4 else 0, "퐁당퐁당": 90 if "PBPBPB" in last6_str or "BPBPBP" in last6_str else 0}
+        positive_scores = {k: v for k, v in scores.items() if v > 0}
+        if not positive_scores: return "혼돈", 0
+        best_pattern = max(positive_scores, key=positive_scores.get)
+        return (best_pattern, positive_scores[best_pattern]) if positive_scores[best_pattern] >= 65 else ("혼돈", 0)
+        
+    def _get_meta_prediction(self, pb_history):
+        meta, score = self._analyze_meta_with_scores(pb_history)
+        if meta == "장줄": return pb_history[-1]
+        elif meta == "퐁당퐁당": return 'B' if pb_history[-1] == 'P' else 'P'
+        cnt = Counter(pb_history[-4:])
+        return 'P' if cnt['P'] >= cnt['B'] else 'B'
 
-    def _calculate_skip_turns(self):
-        """성공 시 스킵할 턴 수를 계산"""
-        clarity = self._analyze_meta_clarity()
-        if clarity == "선명함": return 1
-        return 2
+    def _get_all_expert_predictions(self):
+        pure = [x for x in self.pb_history if x in 'PB']
+        if len(pure) < 6: return {k: random.choice(['P','B']) for k in self.experts}
+        preds = {}
+        # N-gram
+        key3 = tuple(pure[-3:])
+        c3 = Counter(p for i in range(len(pure) - 3) if tuple(pure[i:i+3]) == key3 and i + 3 < len(pure) and (p:=pure[i+3]))
+        preds['ngram'] = c3.most_common(1)[0][0] if c3 else random.choice(['P', 'B'])
+        # Trend
+        cnt = Counter(pure[-4:])
+        preds['trend'] = 'P' if cnt['P'] > cnt['B'] else ('B' if cnt['B'] > cnt['P'] else random.choice(['P','B']))
+        # China (Placeholder) & Meta
+        preds['china'] = random.choice(['P','B'])
+        preds['meta'] = self._get_meta_prediction(self.pb_history)
+        return preds
+
+    def _calculate_skip_turns(self, on_win):
+        meta, score = self._analyze_meta_with_scores(self.pb_history)
+        if on_win: # 적중 시 1~2턴 스킵
+            return 1 if meta != "혼돈" else 2
+        else: # 단계 실패 시 1~3턴 스킵
+            return 3 if meta == "혼돈" else 2
 
     def process_next_turn(self):
-        """AI의 다음 행동을 결정하는 메인 로직"""
         self.should_bet_now = False
         self.next_prediction = None
 
         if len(self.pb_history) < 10:
-            self.analysis_text = "AI: 초기 데이터 수집 중..."
+            self.analysis_text = f"AI: 초기 데이터 수집 중..."
             return
-
         if self.cooldown_turns > 0:
             self.analysis_text = f"AI: 분석중 ({self.cooldown_turns}턴 남음)."
             self.cooldown_turns -= 1
             return
         
-        # --- 6턴 주기 전략 로직 ---
-        core_prediction = self._get_combined_ngram_prediction()
-        current_phase = self.cycle_turn % 6
+        expert_preds = self._get_all_expert_predictions()
         
-        if current_phase in [0, 1, 4, 5]:
-            self.next_prediction = 'B' if core_prediction == 'P' else 'P'
-            strategy_text = "반대 베팅"
-        else:
-            self.next_prediction = core_prediction
-            strategy_text = "찬성 베팅"
-            
-        self.analysis_text = f"AI: [{current_phase + 1}/6] '{strategy_text}' ({self.next_prediction} 예측)"
+        if self.plan_phase == 1: # 1단계: 챔피언
+            self.analysis_text = f"AI: [1단계-챔피언 {self.phase_attempt+1}/2]"
+            expert_hit_rates = {s: (sum(p) / len(p) if p else 0) for s, p in self.recent_performance.items()}
+            champion = max(expert_hit_rates, key=expert_hit_rates.get)
+            self.next_prediction = expert_preds[champion]
+            self.analysis_text += f" '{champion}'"
+        
+        elif self.plan_phase >= 2: # 2단계: 다수결
+            self.analysis_text = f"AI: [2단계-다수결 {self.phase_attempt+1}/2]"
+            votes = Counter(expert_preds.values())
+            # 동점일 경우 트렌드를 따름
+            if votes['P'] == votes['B']:
+                self.next_prediction = expert_preds['trend']
+            else:
+                self.next_prediction = votes.most_common(1)[0][0]
+        
         self.should_bet_now = True
+        self.analysis_text += f" ({self.next_prediction} 예측)"
 
     def handle_input(self, r):
+        # 학습
+        if r in 'PB' and len(self.pb_history) >= 6:
+            preds_before_bet = self._get_all_expert_predictions()
+            for s_name, s_pred in preds_before_bet.items():
+                self.recent_performance[s_name].append(1 if s_pred == r else 0)
+        
         if r == 'T':
-            self.history.append(r)
-            self.hit_record.append(None)
-            self.process_next_turn()
+            self.history.append(r); self.hit_record.append(None); self.process_next_turn()
             return
 
+        # 베팅 결과 처리
         if self.should_bet_now:
             is_hit = (self.next_prediction == r)
             self.bet_count += 1
             self.hit_record.append("O" if is_hit else "X")
             
             if is_hit:
-                self.correct += 1
-                self.current_win += 1
-                self.current_loss = 0
+                self.correct += 1; self.current_win += 1; self.current_loss = 0
                 self.max_win = max(self.max_win, self.current_win)
-                self.cooldown_turns = self._calculate_skip_turns()
+                self.popup_type = "hit"
+                self.cooldown_turns = self._calculate_skip_turns(on_win=True)
+                self.plan_phase, self.phase_attempt = 1, 0
             else:
-                self.incorrect += 1
-                self.current_win = 0
-                self.current_loss += 1
+                self.incorrect += 1; self.current_win = 0; self.current_loss += 1
                 self.max_loss = max(self.max_loss, self.current_loss)
-                # !! 3연패 휴식기 로직 제거 !!
-            
-            self.cycle_turn += 1
+                self.popup_type = "miss"
+
+                if self.phase_attempt == 0:
+                    self.phase_attempt = 1
+                else: # 단계 실패
+                    self.plan_phase += 1
+                    self.phase_attempt = 0
+                    if self.plan_phase > 2: # 모든 단계 실패 (4연패)
+                        self.cooldown_turns, self.plan_phase = 4, 1
+                    else: # 중간 단계 실패 시
+                        self.cooldown_turns = self._calculate_skip_turns(on_win=False)
         else:
             self.hit_record.append(None)
         
         self.history.append(r)
-        if r in 'PB':
-            temp_history = self.pb_history + [r]
-            if len(temp_history) >= 3: self.ngram_counts[3][tuple(temp_history[-3:-1])][temp_history[-1]] += 1
-            if len(temp_history) >= 4: self.ngram_counts[4][tuple(temp_history[-4:-1])][temp_history[-1]] += 1
-            if len(temp_history) >= 5: self.ngram_counts[5][tuple(temp_history[-5:-1])][temp_history[-1]] += 1
-            self.pb_history.append(r)
-
+        if r in 'PB': self.pb_history.append(r)
         self.process_next_turn()
 
     def get_stats(self):
-        return {
-            '총입력': len(self.history),
-            '적중률(%)': round(self.correct / self.bet_count * 100, 2) if self.bet_count else 0,
-            '현재연승': self.current_win,
-            '최대연승': self.max_win,
-            '현재연패': self.current_loss,
-            '최대연패': self.max_loss
-        }
-
+        return {'총입력':len(self.history),'적중률(%)':round(self.correct/self.bet_count*100,2) if self.bet_count else 0,'현재연승':self.current_win,'최대연승':self.max_win,'현재연패':self.current_loss,'최대연패':self.max_loss}
 
 # ========== UI 파트 (변경 없음) ==========
 if 'pred' not in st.session_state:
@@ -138,7 +150,7 @@ if 'stack' not in st.session_state: st.session_state.stack = []
 if 'prev_stats' not in st.session_state: st.session_state.prev_stats = {}
 pred = st.session_state.pred
 
-st.set_page_config(layout="wide", page_title="6-Turn Cycle AI", page_icon="🔄")
+st.set_page_config(layout="wide", page_title="Champion-Vote AI", page_icon="⚖️")
 
 st.markdown("""
 <style>
@@ -164,6 +176,10 @@ div[data-testid="stHorizontalBlock"]>div:nth-child(3) .stButton>button { backgro
 .ai-waiting-bar { background: linear-gradient(90deg, rgba(43,41,0,0.6) 0%, rgba(80,70,0,0.9) 50%, rgba(43,41,0,0.6) 100%); border-radius: 10px; padding: 12px; margin: 10px 0 15px 0; color: #ffd400; font-size: 1.2em; font-weight: 900; text-align: center; width: 100%; }
 .rotating-hourglass { display: inline-block; animation: rotate 2s linear infinite; }
 @keyframes rotate { from{transform:rotate(0deg)} to{transform:rotate(360deg)} }
+.top-notification { text-align:center; font-weight:bold; color:white; padding:8px; margin:-10px -10px 10px -10px; border-radius:8px; animation:slide-in-out 2.5s ease-in-out forwards; }
+.top-notification.hit { background: linear-gradient(90deg, #28a745, #1f8336); }
+.top-notification.miss { background: linear-gradient(90deg, #dc3545, #b32a38); }
+@keyframes slide-in-out { 0%{transform:translateY(-100%);opacity:0} 15%{transform:translateY(0);opacity:1} 85%{transform:translateY(0);opacity:1} 100%{transform:translateY(-100%);opacity:0} }
 .sixgrid-symbol{ border-radius:50%; font-weight:bold; padding:1.5px 7px; display:inline-block; }
 .sixgrid-fluo{ color:#d4ffb3; background:rgba(100,255,110,.25); }
 .sixgrid-miss{ color:#ffb3b3; background:rgba(255,100,110,.25); }
@@ -201,6 +217,12 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 st.session_state.prev_stats = s.copy()
+
+if pred.popup_trigger:
+    result_class = "hit" if pred.popup_type == "hit" else "miss"
+    result_text = "🎉 적중!" if pred.popup_type == "hit" else "💥 미적중!"
+    st.markdown(f'<div class="top-notification {result_class}">{result_text}</div>', unsafe_allow_html=True)
+    st.session_state.pred.popup_trigger = False
 
 st.markdown(f"🧠 **AI 분석**: {pred.analysis_text}", unsafe_allow_html=True)
 
