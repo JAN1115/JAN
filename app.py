@@ -2,7 +2,7 @@ import streamlit as st
 import random, copy, time
 from collections import Counter, defaultdict, deque
 
-# ---------- AI 클래스 및 유틸리티 함수 ----------
+# ---------- AI 클래스 및 유틸리티 함수 (로직 수정) ----------
 class ConcordanceAI:
     def __init__(self):
         self.history, self.pb_history, self.hit_record = [], [], []
@@ -10,32 +10,35 @@ class ConcordanceAI:
         self.current_win, self.current_loss, self.max_win, self.max_loss = 0, 0, 0, 0
         self.cooldown_turns = 0
         
-        # --- 새로운 통합 경쟁 모델 ---
-        self.strategies = ['ngram_3', 'ngram_4', 'ngram_5', 'china_pure', 'trend_pure']
-        self.recent_performance = {s: deque(maxlen=20) for s in self.strategies}
+        # --- 새로운 6턴 주기 전략 상태 변수 ---
+        self.cycle_turn = 0 # 0~5까지 증가하며 6턴 주기를 추적
+        
+        # N-그램 학습 데이터 저장소
         self.ngram_counts = {3: defaultdict(Counter), 4: defaultdict(Counter), 5: defaultdict(Counter)}
 
         self.analysis_text = "AI: 초기 데이터 수집 중..."
         self.next_prediction, self.should_bet_now = None, False
-        self.popup_trigger, self.popup_type = False, None
-
-    def _get_legacy_predictions(self, pb_history):
-        pure = [x for x in pb_history if x in 'PB']
-        if len(pure) < 6: return {k: random.choice(['P','B']) for k in ['china', 'trend']}
-        preds = {}
-        cnt = Counter(pure[-4:])
-        preds['trend'] = 'P' if cnt['P'] > cnt['B'] else ('B' if cnt['B'] > cnt['P'] else random.choice(['P','B']))
-        preds['china'] = random.choice(['P','B']) # Placeholder
-        return preds
 
     def _get_ngram_prediction(self, history, n):
+        """지정된 N-gram을 기반으로 예측을 반환하는 기본 함수"""
         if len(history) < n - 1: return random.choice(['P', 'B'])
         key = tuple(history[-(n-1):])
         counter = self.ngram_counts[n].get(key, None)
         if not counter: return random.choice(['P', 'B'])
         return max(counter, key=counter.get)
 
+    def _get_combined_ngram_prediction(self):
+        """N-gram 3, 4, 5의 예측을 종합하여 다수결로 최종 예측 결정"""
+        preds = [
+            self._get_ngram_prediction(self.pb_history, 3),
+            self._get_ngram_prediction(self.pb_history, 4),
+            self._get_ngram_prediction(self.pb_history, 5)
+        ]
+        # 다수결로 가장 많이 나온 예측을 반환
+        return Counter(preds).most_common(1)[0][0]
+
     def _analyze_meta_clarity(self):
+        """게임 흐름의 선명도를 분석 (스킵 턴 계산에 사용)"""
         pure = [x for x in self.pb_history if x in 'PB']
         if len(pure) < 6: return "혼돈"
         last6_str = "".join(pure[-6:])
@@ -44,6 +47,7 @@ class ConcordanceAI:
         return "혼돈"
 
     def _calculate_skip_turns(self, on_win):
+        """성공 또는 3연패 시 스킵할 턴 수를 계산"""
         clarity = self._analyze_meta_clarity()
         if on_win: # 적중 시 1~2턴 스킵
             if clarity == "선명함": return 1
@@ -53,11 +57,12 @@ class ConcordanceAI:
             return 3
 
     def process_next_turn(self):
+        """AI의 다음 행동을 결정하는 메인 로직"""
         self.should_bet_now = False
         self.next_prediction = None
 
         if len(self.pb_history) < 10:
-            self.analysis_text = f"AI: 초기 데이터 수집 중..."
+            self.analysis_text = "AI: 초기 데이터 수집 중..."
             return
 
         if self.cooldown_turns > 0:
@@ -65,49 +70,31 @@ class ConcordanceAI:
             self.cooldown_turns -= 1
             return
         
-        # --- 통합 경쟁을 통해 '챔피언' 전략 결정 ---
-        strategy_preds = {
-            'ngram_3': self._get_ngram_prediction(self.pb_history, 3),
-            'ngram_4': self._get_ngram_prediction(self.pb_history, 4),
-            'ngram_5': self._get_ngram_prediction(self.pb_history, 5),
-            'china_pure': self._get_legacy_predictions(self.pb_history)['china'],
-            'trend_pure': self._get_legacy_predictions(self.pb_history)['trend'],
-        }
+        # --- 6턴 주기 전략 로직 ---
+        # 1. N-그램 전문가의 핵심 예측 도출
+        core_prediction = self._get_combined_ngram_prediction()
         
-        strategy_hit_rates = {s: (sum(p) / len(p) if p else 0) for s, p in self.recent_performance.items()}
-        champion = max(strategy_hit_rates, key=strategy_hit_rates.get)
+        # 2. 현재 주기에 따라 베팅 방향 결정
+        # cycle_turn은 0부터 5까지 순환 (0,1 -> 반대 | 2,3 -> 찬성 | 4,5 -> 반대)
+        current_phase = self.cycle_turn % 6
         
-        self.next_prediction = strategy_preds.get(champion, random.choice(['P', 'B']))
-        self.analysis_text = f"AI: [통합경쟁] '{champion}' 전략 선택 ({self.next_prediction} 예측)"
+        if current_phase in [0, 1, 4, 5]: # 반대 베팅 단계
+            self.next_prediction = 'B' if core_prediction == 'P' else 'P'
+            strategy_text = "반대 베팅"
+        else: # 찬성 베팅 단계
+            self.next_prediction = core_prediction
+            strategy_text = "찬성 베팅"
+            
+        self.analysis_text = f"AI: [{current_phase + 1}/6] '{strategy_text}' ({self.next_prediction} 예측)"
         self.should_bet_now = True
 
     def handle_input(self, r):
-        # 학습 로직
-        if r in 'PB' and len(self.pb_history) >= 6:
-            # 베팅이 실행될 예정이었다면, 모든 전략의 성과를 기록
-            if self.should_bet_now:
-                # 베팅 전 시점의 기록으로 예측
-                history_before_bet = self.pb_history
-                preds_before_bet = {
-                    'ngram_3': self._get_ngram_prediction(history_before_bet, 3),
-                    'ngram_4': self._get_ngram_prediction(history_before_bet, 4),
-                    'ngram_5': self._get_ngram_prediction(history_before_bet, 5),
-                    'china_pure': self._get_legacy_predictions(history_before_bet)['china'],
-                    'trend_pure': self._get_legacy_predictions(history_before_bet)['trend'],
-                }
-                for s_name, s_pred in preds_before_bet.items():
-                    self.recent_performance[s_name].append(1 if s_pred == r else 0)
-        
+        # 타이는 기록만 하고 다음 턴으로
         if r == 'T':
-            self.history.append(r); self.hit_record.append(None); self.process_next_turn()
+            self.history.append(r)
+            self.hit_record.append(None)
+            self.process_next_turn()
             return
-
-        # N-gram 카운트 업데이트
-        if r in 'PB':
-            temp_history = self.pb_history + [r]
-            if len(temp_history) >= 3: self.ngram_counts[3][tuple(temp_history[-3:-1])][temp_history[-1]] += 1
-            if len(temp_history) >= 4: self.ngram_counts[4][tuple(temp_history[-4:-1])][temp_history[-1]] += 1
-            if len(temp_history) >= 5: self.ngram_counts[5][tuple(temp_history[-5:-1])][temp_history[-1]] += 1
 
         # 베팅 실행 및 결과 처리
         if self.should_bet_now:
@@ -116,25 +103,46 @@ class ConcordanceAI:
             self.hit_record.append("O" if is_hit else "X")
             
             if is_hit:
-                self.correct += 1; self.current_win += 1; self.current_loss = 0
+                self.correct += 1
+                self.current_win += 1
+                self.current_loss = 0
                 self.max_win = max(self.max_win, self.current_win)
                 self.cooldown_turns = self._calculate_skip_turns(on_win=True)
             else:
-                self.incorrect += 1; self.current_win = 0; self.current_loss += 1
+                self.incorrect += 1
+                self.current_win = 0
+                self.current_loss += 1
                 self.max_loss = max(self.max_loss, self.current_loss)
-                # 3연패 이상 시 스킵 발동
                 if self.current_loss >= 3:
                     self.cooldown_turns = self._calculate_skip_turns(on_win=False)
                     self.current_loss = 0 # 스킵 후 연패 기록 초기화
+            
+            # 베팅이 실행되었으므로 사이클 턴을 1 증가
+            self.cycle_turn += 1
         else:
             self.hit_record.append(None)
         
+        # 전체 기록 및 PB 기록 업데이트
         self.history.append(r)
-        if r in 'PB': self.pb_history.append(r)
+        if r in 'PB':
+            # N-gram 카운트 업데이트 (결과 반영 후)
+            temp_history = self.pb_history + [r]
+            if len(temp_history) >= 3: self.ngram_counts[3][tuple(temp_history[-3:-1])][temp_history[-1]] += 1
+            if len(temp_history) >= 4: self.ngram_counts[4][tuple(temp_history[-4:-1])][temp_history[-1]] += 1
+            if len(temp_history) >= 5: self.ngram_counts[5][tuple(temp_history[-5:-1])][temp_history[-1]] += 1
+            self.pb_history.append(r)
+
         self.process_next_turn()
 
     def get_stats(self):
-        return {'총입력':len(self.history),'적중률(%)':round(self.correct/self.bet_count*100,2) if self.bet_count else 0,'현재연승':self.current_win,'최대연승':self.max_win,'현재연패':self.current_loss,'최대연패':self.max_loss}
+        return {
+            '총입력': len(self.history),
+            '적중률(%)': round(self.correct / self.bet_count * 100, 2) if self.bet_count else 0,
+            '현재연승': self.current_win,
+            '최대연승': self.max_win,
+            '현재연패': self.current_loss,
+            '최대연패': self.max_loss
+        }
 
 
 # ========== UI 파트 (변경 없음) ==========
@@ -145,7 +153,7 @@ if 'stack' not in st.session_state: st.session_state.stack = []
 if 'prev_stats' not in st.session_state: st.session_state.prev_stats = {}
 pred = st.session_state.pred
 
-st.set_page_config(layout="wide", page_title="Unified Competition AI", page_icon="🏆")
+st.set_page_config(layout="wide", page_title="6-Turn Cycle AI", page_icon="🔄")
 
 st.markdown("""
 <style>
@@ -171,10 +179,6 @@ div[data-testid="stHorizontalBlock"]>div:nth-child(3) .stButton>button { backgro
 .ai-waiting-bar { background: linear-gradient(90deg, rgba(43,41,0,0.6) 0%, rgba(80,70,0,0.9) 50%, rgba(43,41,0,0.6) 100%); border-radius: 10px; padding: 12px; margin: 10px 0 15px 0; color: #ffd400; font-size: 1.2em; font-weight: 900; text-align: center; width: 100%; }
 .rotating-hourglass { display: inline-block; animation: rotate 2s linear infinite; }
 @keyframes rotate { from{transform:rotate(0deg)} to{transform:rotate(360deg)} }
-.top-notification { text-align:center; font-weight:bold; color:white; padding:8px; margin:-10px -10px 10px -10px; border-radius:8px; animation:slide-in-out 2.5s ease-in-out forwards; }
-.top-notification.hit { background: linear-gradient(90deg, #28a745, #1f8336); }
-.top-notification.miss { background: linear-gradient(90deg, #dc3545, #b32a38); }
-@keyframes slide-in-out { 0%{transform:translateY(-100%);opacity:0} 15%{transform:translateY(0);opacity:1} 85%{transform:translateY(0);opacity:1} 100%{transform:translateY(-100%);opacity:0} }
 .sixgrid-symbol{ border-radius:50%; font-weight:bold; padding:1.5px 7px; display:inline-block; }
 .sixgrid-fluo{ color:#d4ffb3; background:rgba(100,255,110,.25); }
 .sixgrid-miss{ color:#ffb3b3; background:rgba(255,100,110,.25); }
@@ -212,12 +216,6 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 st.session_state.prev_stats = s.copy()
-
-if pred.popup_trigger:
-    result_class = "hit" if pred.popup_type == "hit" else "miss"
-    result_text = "🎉 적중!" if pred.popup_type == "hit" else "💥 미적중!"
-    st.markdown(f'<div class="top-notification {result_class}">{result_text}</div>', unsafe_allow_html=True)
-    st.session_state.pred.popup_trigger = False
 
 st.markdown(f"🧠 **AI 분석**: {pred.analysis_text}", unsafe_allow_html=True)
 
