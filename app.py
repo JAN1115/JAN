@@ -46,15 +46,11 @@ class ConcordanceAI:
         if "PPP" in last6_str or "BBB" in last6_str or "PBP" in last6_str or "BPB" in last6_str: return "보통"
         return "혼돈"
 
-    def _calculate_skip_turns(self, on_win):
-        """성공 또는 3연패 시 스킵할 턴 수를 계산"""
+    def _calculate_skip_turns(self):
+        """성공 시 스킵할 턴 수를 계산"""
         clarity = self._analyze_meta_clarity()
-        if on_win: # 적중 시 1~2턴 스킵
-            if clarity == "선명함": return 1
-            return 2
-        else: # 3연패 이상 시 3~4턴 스킵
-            if clarity == "혼돈": return 4
-            return 3
+        if clarity == "선명함": return 1
+        return 2
 
     def process_next_turn(self):
         """AI의 다음 행동을 결정하는 메인 로직"""
@@ -71,17 +67,13 @@ class ConcordanceAI:
             return
         
         # --- 6턴 주기 전략 로직 ---
-        # 1. N-그램 전문가의 핵심 예측 도출
         core_prediction = self._get_combined_ngram_prediction()
-        
-        # 2. 현재 주기에 따라 베팅 방향 결정
-        # cycle_turn은 0부터 5까지 순환 (0,1 -> 반대 | 2,3 -> 찬성 | 4,5 -> 반대)
         current_phase = self.cycle_turn % 6
         
-        if current_phase in [0, 1, 4, 5]: # 반대 베팅 단계
+        if current_phase in [0, 1, 4, 5]:
             self.next_prediction = 'B' if core_prediction == 'P' else 'P'
             strategy_text = "반대 베팅"
-        else: # 찬성 베팅 단계
+        else:
             self.next_prediction = core_prediction
             strategy_text = "찬성 베팅"
             
@@ -89,14 +81,12 @@ class ConcordanceAI:
         self.should_bet_now = True
 
     def handle_input(self, r):
-        # 타이는 기록만 하고 다음 턴으로
         if r == 'T':
             self.history.append(r)
             self.hit_record.append(None)
             self.process_next_turn()
             return
 
-        # 베팅 실행 및 결과 처리
         if self.should_bet_now:
             is_hit = (self.next_prediction == r)
             self.bet_count += 1
@@ -107,25 +97,20 @@ class ConcordanceAI:
                 self.current_win += 1
                 self.current_loss = 0
                 self.max_win = max(self.max_win, self.current_win)
-                self.cooldown_turns = self._calculate_skip_turns(on_win=True)
+                self.cooldown_turns = self._calculate_skip_turns()
             else:
                 self.incorrect += 1
                 self.current_win = 0
                 self.current_loss += 1
                 self.max_loss = max(self.max_loss, self.current_loss)
-                if self.current_loss >= 3:
-                    self.cooldown_turns = self._calculate_skip_turns(on_win=False)
-                    self.current_loss = 0 # 스킵 후 연패 기록 초기화
+                # !! 3연패 휴식기 로직 제거 !!
             
-            # 베팅이 실행되었으므로 사이클 턴을 1 증가
             self.cycle_turn += 1
         else:
             self.hit_record.append(None)
         
-        # 전체 기록 및 PB 기록 업데이트
         self.history.append(r)
         if r in 'PB':
-            # N-gram 카운트 업데이트 (결과 반영 후)
             temp_history = self.pb_history + [r]
             if len(temp_history) >= 3: self.ngram_counts[3][tuple(temp_history[-3:-1])][temp_history[-1]] += 1
             if len(temp_history) >= 4: self.ngram_counts[4][tuple(temp_history[-4:-1])][temp_history[-1]] += 1
