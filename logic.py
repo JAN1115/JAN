@@ -210,7 +210,7 @@ class MLConcordanceAI:
         if self.drift.add(hit_val) and self.consecutive_miss >= 4:
             self.rl_mode = False; self.q_table.clear()
 
-        winning_strats = {s: dynamic_weights.get(s, 0) for s, p in preds.items() if p == final_prediction}
+        winning_strats = {s: dynamic_weights.get(s, 0) for s in preds if preds[s] == final_prediction}
         strategy = max(winning_strats, key=winning_strats.get) if winning_strats else None
         
         self.analysis_text = f"AI 예측: [Phase: {game_phase}] [WM -> {strategy if strategy else 'Vote'}] ➡️ {final_prediction}"
@@ -234,6 +234,14 @@ class MLConcordanceAI:
                     self.max_loss = max(self.max_loss, self.current_loss)
                 self.hit_record.append('O' if hit else 'X')
                 self.combiner.update(self.last_preds, result, hit)
+
+                phase = self.last_game_phase 
+                for model_name, prediction in self.last_preds.items():
+                    if prediction in ['P', 'B']:
+                        self.expertise_matrix[phase][model_name]['total'] += 1
+                        if prediction == result:
+                            self.expertise_matrix[phase][model_name]['correct'] += 1
+
                 update_feats = create_features(prev_game_history)
                 if self.last_strategy == 'RL' and update_feats:
                     state_tuple = (prev_game_history[-2], prev_game_history[-1], round(update_feats['recent_p_ratio'], 1), round(update_feats['volatility'], 1))
