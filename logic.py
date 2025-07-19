@@ -21,6 +21,7 @@ class PatternDetector:
         window = pb_history[-self.window_size:]
         trend_count = sum(1 for i in range(1, len(window)) if window[i] == window[i-1])
         total_transitions = len(window) - 1
+        if total_transitions == 0: return 'NEUTRAL'
         trend_ratio = trend_count / total_transitions
         chop_ratio = 1 - trend_ratio
         if trend_ratio >= self.trend_threshold:
@@ -37,14 +38,13 @@ def create_features(history):
     if len(pb_history) < 6:
         return None
     window = pb_history[-10:]
+    if len(window) < 2: return None
     features['recent_p_ratio'] = window.count('P') / len(window)
     features['volatility'] = sum(1 for i in range(1, len(window)) if window[i] != window[i-1]) / (len(window)-1)
     grams2 = ''.join(pb_history[-2:])
     grams3 = ''.join(pb_history[-3:])
-    for g in ['PP','PB','BP','BB']:
-        features[f'2_gram_{g}'] = int(grams2 == g)
-    for g in ['PPP','PPB','PBP','PBB','BPP','BPB','BBP','BBB']:
-        features[f'3_gram_{g}'] = int(grams3 == g)
+    for g in ['PP','PB','BP','BB']: features[f'2_gram_{g}'] = int(grams2 == g)
+    for g in ['PPP','PPB','PBP','PBB','BPP','BPB','BBP','BBB']: features[f'3_gram_{g}'] = int(grams3 == g)
     last4 = ''.join(pb_history[-4:])
     last6 = ''.join(pb_history[-6:])
     features['is_3_1_pattern'] = int(last4 in ['PPPB','BBBP'])
@@ -57,10 +57,8 @@ class ExpSmoother:
         self.alpha = alpha
         self.ema = None
     def update(self, value):
-        if self.ema is None:
-            self.ema = value
-        else:
-            self.ema = self.alpha * value + (1 - self.alpha) * self.ema
+        if self.ema is None: self.ema = value
+        else: self.ema = self.alpha * value + (1 - self.alpha) * self.ema
         return self.ema
 
 # --- 컨셉 드리프트 감지 ---
@@ -82,10 +80,8 @@ class DriftDetector:
 def calc_big_road(history):
     road, prev = [], None
     for r in [h for h in history if h in 'PB']:
-        if prev is None or r != prev:
-            road.append([r])
-        else:
-            road[-1].append(r)
+        if prev is None or r != prev: road.append([r])
+        else: road[-1].append(r)
         prev = r
     return road
 
@@ -122,19 +118,15 @@ class WeightedMajorityCombiner:
 class MLConcordanceAI:
     def __init__(self, model_path='baccarat_model.joblib',
                  lgbm_model_path='baccarat_lgbm_model.joblib'):
-        self.history = []
-        self.game_history = []
-        self.hit_record = []
-        self.bet_count = self.correct = self.incorrect = 0
-        self.current_win = self.max_win = 0
-        self.current_loss = self.max_loss = 0
+        self.history, self.game_history, self.hit_record = [], [], []
+        self.bet_count, self.correct, self.incorrect = 0, 0, 0
+        self.current_win, self.max_win = 0, 0
+        self.current_loss, self.max_loss = 0, 0
         self.last_bet_result = None
         self.analysis_text = "AI: 초기 데이터 수집 중..."
-        self.next_prediction = None
-        self.should_bet_now = False
-        self.rl_mode = False
+        self.next_prediction, self.should_bet_now = None, False
+        self.rl_mode, self.consecutive_miss = False, 0
         self.q_table = defaultdict(lambda:{'P':0.0,'B':0.0})
-        self.consecutive_miss = 0
 
         self.model = joblib.load(model_path)
         self.lgbm_model = joblib.load(lgbm_model_path)
@@ -143,6 +135,13 @@ class MLConcordanceAI:
         self.drift = DriftDetector(windows=(10,50), threshold=0.2)
         self.combiner = WeightedMajorityCombiner(beta=0.95, min_beta=0.5, decay=0.99)
         self.pattern_detector = PatternDetector()
+        
+        self.expertise_matrix = {
+            'TRENDING': {model: {'correct': 0, 'total': 0} for model in self.combiner.weights.keys()},
+            'CHOPPY': {model: {'correct': 0, 'total': 0} for model in self.combiner.weights.keys()},
+            'NEUTRAL': {model: {'correct': 0, 'total': 0} for model in self.combiner.weights.keys()}
+        }
+        self.last_game_phase = 'NEUTRAL'
         
         self.last_preds = {s:None for s in self.combiner.weights.keys()}
         self.last_strategy = None
@@ -156,8 +155,7 @@ class MLConcordanceAI:
         br = calc_big_road(self.game_history)
         for off in (1,2,3):
             dr = calc_derived_road(br, off)
-            if dr:
-                votes.append(dr[-1])
+            if dr: votes.append(dr[-1])
         return Counter(votes).most_common(1)[0][0] if votes else None
         
     def predict_next(self):
@@ -188,13 +186,16 @@ class MLConcordanceAI:
         else: preds['RL'] = None
 
         game_phase = self.pattern_detector.detect(self.game_history)
+        self.last_game_phase = game_phase
+
         dynamic_weights = self.combiner.weights.copy()
-        boost_factor = 1.5
         
-        if game_phase == 'TRENDING':
-            dynamic_weights['EMA'] *= boost_factor
-        elif game_phase == 'CHOPPY':
-            dynamic_weights['LGBM'] *= boost_factor
+        phase_experts = self.expertise_matrix[game_phase]
+        for model_name, stats in phase_experts.items():
+            if stats['total'] > 5:
+                accuracy = stats['correct'] / stats['total']
+                boost_factor = 1 + (accuracy - 0.5)
+                dynamic_weights[model_name] *= boost_factor
         
         votes = {'P': 0.0, 'B': 0.0}
         for strat, p in preds.items():
@@ -206,14 +207,14 @@ class MLConcordanceAI:
         else:
             final_prediction = 'P' if votes['P'] > votes['B'] else 'B'
         
-        hit_val = 1 if self.last_bet_result else 0
+        hit_val = 1 if self.last_bet_result is True else 0
         if self.drift.add(hit_val) and self.consecutive_miss >= 4:
             self.rl_mode = False; self.q_table.clear()
 
-        winning_strats = {s: dynamic_weights.get(s, 0) for s in preds if preds[s] == final_prediction}
+        winning_strats = {s: dynamic_weights.get(s, 0) for s, p in preds.items() if p == final_prediction}
         strategy = max(winning_strats, key=winning_strats.get) if winning_strats else None
         
-        self.analysis_text = f"AI 예측: [Phase: {game_phase}] [WM -> {strategy if strategy else 'Vote'}] ➡️ {final_prediction}"
+        self.analysis_text = f"AI 예측: [Phase: {game_phase}] [Expert -> {strategy if strategy else 'Vote'}] ➡️ {final_prediction}"
         self.last_preds = preds
         self.next_prediction = final_prediction
         self.last_strategy = strategy
@@ -222,10 +223,12 @@ class MLConcordanceAI:
     def handle_input(self, result):
         prev_game_history = [h for h in self.game_history if h in 'PB']
         if result == 'T':
-            self.history.append(result); self.hit_record.append(None); self.analysis_text = "AI: TIE, 베팅 스킵."
+            self.history.append('T'); self.hit_record.append(None)
+            self.analysis_text = "AI: TIE, 베팅 스킵."
         else:
             if self.should_bet_now:
-                hit = (self.next_prediction == result); self.bet_count += 1
+                hit = (self.next_prediction == result)
+                self.bet_count += 1
                 if hit:
                     self.correct += 1; self.current_win += 1; self.current_loss = 0; self.consecutive_miss = 0
                     self.max_win = max(self.max_win, self.current_win)
@@ -248,7 +251,6 @@ class MLConcordanceAI:
                     reward = 1 if hit else -1; q = self.q_table[state_tuple]
                     next_q_val = max(q.values()) if q else 0
                     q[self.next_prediction] = q.get(self.next_prediction,0) + 0.1 * (reward + 0.9 * next_q_val - q.get(self.next_prediction,0))
-                
                 self.last_bet_result = hit
             else:
                 self.hit_record.append(None)
