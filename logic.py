@@ -206,19 +206,6 @@ class MLConcordanceAI:
         else:
             final_prediction = 'P' if votes['P'] > votes['B'] else 'B'
         
-        # --- 신뢰도 계산 및 베팅 결정 (새로 추가된 핵심 로직) ---
-        total_votes = sum(votes.values())
-        confidence = 0.0
-        if total_votes > 0:
-            confidence = abs(votes['P'] - votes['B']) / total_votes
-        
-        # 신뢰도 임계값 설정 (0.5는 득표율 75% 이상을 의미)
-        CONFIDENCE_THRESHOLD = 0.5 
-        
-        # 신뢰도가 임계값 이상일 때만 베팅을 결정
-        self.should_bet_now = (final_prediction is not None) and (confidence >= CONFIDENCE_THRESHOLD)
-        # --- 로직 종료 ---
-        
         hit_val = 1 if self.last_bet_result else 0
         if self.drift.add(hit_val) and self.consecutive_miss >= 4:
             self.rl_mode = False; self.q_table.clear()
@@ -226,13 +213,11 @@ class MLConcordanceAI:
         winning_strats = {s: dynamic_weights.get(s, 0) for s, p in preds.items() if p == final_prediction}
         strategy = max(winning_strats, key=winning_strats.get) if winning_strats else None
         
-        # 분석 메시지에 신뢰도와 베팅 여부 표시
-        bet_or_skip = "베팅" if self.should_bet_now else "스킵"
-        self.analysis_text = f"AI 예측: [Phase: {game_phase}] [Conf: {confidence:.0%}] ➡️ {final_prediction} ({bet_or_skip})"
-        
+        self.analysis_text = f"AI 예측: [Phase: {game_phase}] [WM -> {strategy if strategy else 'Vote'}] ➡️ {final_prediction}"
         self.last_preds = preds
         self.next_prediction = final_prediction
         self.last_strategy = strategy
+        self.should_bet_now = (final_prediction is not None)
 
     def handle_input(self, result):
         prev_game_history = [h for h in self.game_history if h in 'PB']
