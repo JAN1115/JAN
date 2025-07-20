@@ -6,13 +6,11 @@ import joblib
 import numpy as np
 from sklearn.linear_model import SGDClassifier
 
-# --- 패턴 감지기 클래스 (window_size 동적으로 받을 수 있도록) ---
 class PatternDetector:
     def __init__(self, window_size=20, trend_threshold=0.6, chop_threshold=0.6):
         self.window_size = window_size
         self.trend_threshold = trend_threshold
         self.chop_threshold = chop_threshold
-
     def detect(self, history, custom_window=None):
         win = custom_window if custom_window is not None else self.window_size
         pb_history = [r for r in history if r in 'PB']
@@ -31,7 +29,6 @@ class PatternDetector:
         else:
             return 'NEUTRAL'
 
-# --- 특징(Feature) 추출 함수 (window_size 동적) ---
 def create_features(history, feature_window=10):
     features = {}
     pb_history = [r for r in history if r in 'PB']
@@ -51,7 +48,6 @@ def create_features(history, feature_window=10):
     features['is_3_3_pattern'] = int(last6 in ['PPPBBB','BBBPPP'])
     return features
 
-# --- 지수평활 ---
 class ExpSmoother:
     def __init__(self, alpha=0.3):
         self.alpha = alpha
@@ -61,7 +57,6 @@ class ExpSmoother:
         else: self.ema = self.alpha * value + (1 - self.alpha) * self.ema
         return self.ema
 
-# --- 컨셉 드리프트 감지 ---
 class DriftDetector:
     def __init__(self, windows=(10,50), threshold=0.2):
         self.deques = [deque(maxlen=w) for w in windows]
@@ -76,7 +71,6 @@ class DriftDetector:
                     drifted = True
         return drifted
 
-# --- 중국점 헬퍼 ---
 def calc_big_road(history):
     road, prev = [], None
     for r in [h for h in history if h in 'PB']:
@@ -91,7 +85,6 @@ def calc_derived_road(big_road, offset):
         derived.append('P' if len(big_road[i]) == len(big_road[i-offset]) else 'B')
     return derived
 
-# --- 가중치 앙상블 ---
 class WeightedMajorityCombiner:
     def __init__(self, beta=0.95, min_beta=0.5, decay=0.99):
         self.beta = beta
@@ -114,7 +107,6 @@ class WeightedMajorityCombiner:
             for strat in self.weights:
                 self.weights[strat] /= total
 
-# ---------- 통합 AI 클래스 ----------
 class MLConcordanceAI:
     def __init__(self, model_path='baccarat_model.joblib',
                  lgbm_model_path='baccarat_lgbm_model.joblib'):
@@ -134,12 +126,13 @@ class MLConcordanceAI:
         self.exp_smoother = ExpSmoother(alpha=0.2)
         self.drift = DriftDetector(windows=(10,50), threshold=0.2)
         self.combiner = WeightedMajorityCombiner(beta=0.95, min_beta=0.5, decay=0.99)
-        # --- 원래와 재정렬(ALT) 패턴감지기/피처 생성기 모두 준비 ---
         self.pattern_detector = PatternDetector(window_size=20)
         self.pattern_detector_alt = PatternDetector(window_size=8)
         self.alt_mode = False
         self.alt_mode_count = 0
-        self.alt_miss_count = 0  # 두 번 다 실패시 원복
+        self.alt_miss_count = 0
+        self.force_reverse_mode = False
+        self.force_reverse_hit = False
         
         self.expertise_matrix = {
             'TRENDING': {model: {'correct': 0, 'total': 0} for model in self.combiner.weights.keys()},
@@ -155,7 +148,7 @@ class MLConcordanceAI:
     def rule_predict(self, alt=False):
         ph = [h for h in self.game_history if h in 'PB']
         votes = []
-        win = 2 if not alt else 1  # ALT 모드에선 더 촘촘한 비교
+        win = 2 if not alt else 1
         if len(ph) >= win+1 and ph[-1] == ph[-1-win]:
             votes.append(ph[-1])
         br = calc_big_road(self.game_history)
@@ -166,16 +159,30 @@ class MLConcordanceAI:
         
     def predict_next(self):
         ph = [h for h in self.game_history if h in 'PB']
-        # --- 재정렬 ALT 모드 진입조건 ---
-        if not self.alt_mode and self.current_loss == 3:
+
+        # 3연패 진입 -> 재정렬 모드 진입
+        if not self.alt_mode and not self.force_reverse_mode and self.current_loss == 3:
             self.alt_mode = True
             self.alt_mode_count = 0
             self.alt_miss_count = 0
-            self.analysis_text = "[AI: 패턴 재정렬/창 크기 축소모드 진입]"
-        
-        # --- ALT 모드: 재정렬로 2번 예측 ---
+            self.analysis_text = "[AI: 패턴 재정렬모드 진입]"
+
+        # alt_mode: 재정렬로 2회 예측, 모두 실패면 force_reverse_mode
+        if self.force_reverse_mode:
+            # 기존 예측값의 반대로 강제 예측 1회
+            if self.last_alt_final_pred is not None:
+                final_prediction = 'B' if self.last_alt_final_pred == 'P' else 'P'
+                self.analysis_text = "[AI: 반대 강제 예측] ➡️ " + final_prediction
+                self.next_prediction = final_prediction
+                self.last_strategy = "FORCE_REVERSE"
+                self.should_bet_now = True
+                return
+            else:
+                # 예외적으로 alt 예측값 없음(예측실패 등)일 때는 그냥 진행
+                self.force_reverse_mode = False
+
         if self.alt_mode:
-            feature_win = 8   # 재정렬: 더 작은 패턴 창, 더 빠른 탐색
+            feature_win = 8
             pattern_detector = self.pattern_detector_alt
         else:
             feature_win = 10
@@ -227,6 +234,12 @@ class MLConcordanceAI:
         else:
             final_prediction = 'P' if votes['P'] > votes['B'] else 'B'
 
+        # ALT 모드에서는 반대 예측 위해 기록
+        if self.alt_mode:
+            self.last_alt_final_pred = final_prediction
+        else:
+            self.last_alt_final_pred = None
+
         hit_val = 1 if self.last_bet_result is True else 0
         if self.drift.add(hit_val) and self.consecutive_miss >= 4:
             self.rl_mode = False; self.q_table.clear()
@@ -234,11 +247,14 @@ class MLConcordanceAI:
         winning_strats = {s: dynamic_weights.get(s, 0) for s, p in preds.items() if p == final_prediction}
         strategy = max(winning_strats, key=winning_strats.get) if winning_strats else None
 
-        # --- ALT 모드 시 안내문 ---
-        if self.alt_mode:
+        # 안내문
+        if self.force_reverse_mode:
+            self.analysis_text = f"[AI: 반대 강제 예측] [Expert -> {strategy if strategy else 'Vote'}] ➡️ {final_prediction}"
+        elif self.alt_mode:
             self.analysis_text = f"[AI: 패턴 재정렬모드] [Expert -> {strategy if strategy else 'Vote'}] ➡️ {final_prediction}"
         else:
             self.analysis_text = f"AI 예측: [Phase: {game_phase}] [Expert -> {strategy if strategy else 'Vote'}] ➡️ {final_prediction}"
+
         self.last_preds = preds
         self.next_prediction = final_prediction
         self.last_strategy = strategy
@@ -276,23 +292,35 @@ class MLConcordanceAI:
                     next_q_val = max(q.values()) if q else 0
                     q[self.next_prediction] = q.get(self.next_prediction,0) + 0.1 * (reward + 0.9 * next_q_val - q.get(self.next_prediction,0))
 
-                # ALT모드 평가: 2연속 실패시 원복
+                # ALT, FORCE_REVERSE 모드 평가
                 if self.alt_mode:
                     self.alt_mode_count += 1
-                    if not hit:
+                    if hit:
+                        # 한 번이라도 맞추면 즉시 복귀
+                        self.alt_mode = False
+                        self.alt_mode_count = 0
+                        self.alt_miss_count = 0
+                        self.force_reverse_mode = False
+                    else:
                         self.alt_miss_count += 1
-                    # ALT모드 2회 모두 실패면 원복
-                    if self.alt_mode_count >= 2:
-                        if self.alt_miss_count >= 2:
-                            self.alt_mode = False
-                            self.alt_mode_count = 0
-                            self.alt_miss_count = 0
-                            self.analysis_text += " [AI: 재정렬 2회 실패, 원래 모드로 복귀]"
-                        else:
-                            # 1회라도 성공시 ALT모드 유지 or 바로 원복(옵션)
-                            self.alt_mode = False
-                            self.alt_mode_count = 0
-                            self.alt_miss_count = 0
+                        if self.alt_mode_count >= 2:
+                            if self.alt_miss_count >= 2:
+                                # 2번 모두 실패 → 반대예측 모드 진입
+                                self.alt_mode = False
+                                self.force_reverse_mode = True
+                                self.alt_mode_count = 0
+                                self.alt_miss_count = 0
+                            else:
+                                # 1회라도 맞으면 복귀(위에서 처리됨)
+                                self.alt_mode = False
+                                self.alt_mode_count = 0
+                                self.alt_miss_count = 0
+
+                elif self.force_reverse_mode:
+                    # 반대 예측 한 번 실행, 맞추면 바로 복귀, 실패해도 복귀
+                    self.force_reverse_mode = False
+                    self.last_alt_final_pred = None  # 리셋
+                    # 맞추면 바로 복귀, 틀려도 복귀
 
                 self.last_bet_result = hit
             else:
