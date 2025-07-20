@@ -1,24 +1,24 @@
 import os
 import random
-import time
 from collections import Counter, defaultdict, deque
 import pandas as pd
 import joblib
 import numpy as np
 from sklearn.linear_model import SGDClassifier
 
-# --- 패턴 감지기 클래스 ---
+# --- 패턴 감지기 클래스 (window_size 동적으로 받을 수 있도록) ---
 class PatternDetector:
     def __init__(self, window_size=20, trend_threshold=0.6, chop_threshold=0.6):
         self.window_size = window_size
         self.trend_threshold = trend_threshold
         self.chop_threshold = chop_threshold
 
-    def detect(self, history):
+    def detect(self, history, custom_window=None):
+        win = custom_window if custom_window is not None else self.window_size
         pb_history = [r for r in history if r in 'PB']
-        if len(pb_history) < self.window_size:
+        if len(pb_history) < win:
             return 'NEUTRAL'
-        window = pb_history[-self.window_size:]
+        window = pb_history[-win:]
         trend_count = sum(1 for i in range(1, len(window)) if window[i] == window[i-1])
         total_transitions = len(window) - 1
         if total_transitions == 0: return 'NEUTRAL'
@@ -31,13 +31,13 @@ class PatternDetector:
         else:
             return 'NEUTRAL'
 
-# --- 특징(Feature) 추출 함수 ---
-def create_features(history):
+# --- 특징(Feature) 추출 함수 (window_size 동적) ---
+def create_features(history, feature_window=10):
     features = {}
     pb_history = [r for r in history if r in 'PB']
-    if len(pb_history) < 6:
+    if len(pb_history) < max(6, feature_window):
         return None
-    window = pb_history[-10:]
+    window = pb_history[-feature_window:]
     if len(window) < 2: return None
     features['recent_p_ratio'] = window.count('P') / len(window)
     features['volatility'] = sum(1 for i in range(1, len(window)) if window[i] != window[i-1]) / (len(window)-1)
@@ -134,7 +134,12 @@ class MLConcordanceAI:
         self.exp_smoother = ExpSmoother(alpha=0.2)
         self.drift = DriftDetector(windows=(10,50), threshold=0.2)
         self.combiner = WeightedMajorityCombiner(beta=0.95, min_beta=0.5, decay=0.99)
-        self.pattern_detector = PatternDetector()
+        # --- 원래와 재정렬(ALT) 패턴감지기/피처 생성기 모두 준비 ---
+        self.pattern_detector = PatternDetector(window_size=20)
+        self.pattern_detector_alt = PatternDetector(window_size=8)
+        self.alt_mode = False
+        self.alt_mode_count = 0
+        self.alt_miss_count = 0  # 두 번 다 실패시 원복
         
         self.expertise_matrix = {
             'TRENDING': {model: {'correct': 0, 'total': 0} for model in self.combiner.weights.keys()},
@@ -147,10 +152,11 @@ class MLConcordanceAI:
         self.last_strategy = None
         self.predict_next()
 
-    def rule_predict(self):
+    def rule_predict(self, alt=False):
         ph = [h for h in self.game_history if h in 'PB']
         votes = []
-        if len(ph)>=2 and ph[-1]==ph[-2]:
+        win = 2 if not alt else 1  # ALT 모드에선 더 촘촘한 비교
+        if len(ph) >= win+1 and ph[-1] == ph[-1-win]:
             votes.append(ph[-1])
         br = calc_big_road(self.game_history)
         for off in (1,2,3):
@@ -160,7 +166,22 @@ class MLConcordanceAI:
         
     def predict_next(self):
         ph = [h for h in self.game_history if h in 'PB']
-        if len(ph) < 6:
+        # --- 재정렬 ALT 모드 진입조건 ---
+        if not self.alt_mode and self.current_loss == 3:
+            self.alt_mode = True
+            self.alt_mode_count = 0
+            self.alt_miss_count = 0
+            self.analysis_text = "[AI: 패턴 재정렬/창 크기 축소모드 진입]"
+        
+        # --- ALT 모드: 재정렬로 2번 예측 ---
+        if self.alt_mode:
+            feature_win = 8   # 재정렬: 더 작은 패턴 창, 더 빠른 탐색
+            pattern_detector = self.pattern_detector_alt
+        else:
+            feature_win = 10
+            pattern_detector = self.pattern_detector
+
+        if len(ph) < max(6, feature_win):
             self.analysis_text = "AI: 초기 데이터 수집 중..."
             self.should_bet_now = False
             return
@@ -169,7 +190,7 @@ class MLConcordanceAI:
         ema_val = self.exp_smoother.update(1 if ph[-1]=='P' else 0)
         preds['EMA'] = 'P' if ema_val > 0.5 else 'B'
         
-        feats = create_features(self.game_history)
+        feats = create_features(self.game_history, feature_window=feature_win)
         if feats:
             df_for_predict = pd.DataFrame([feats])
             preds['ML'] = self.model.predict(df_for_predict)[0]
@@ -177,7 +198,7 @@ class MLConcordanceAI:
         else:
             preds['ML'], preds['LGBM'] = None, None
         
-        preds['Rule'] = self.rule_predict()
+        preds['Rule'] = self.rule_predict(alt=self.alt_mode)
         if self.current_loss >= 3: self.rl_mode = True
         if self.rl_mode and feats:
             state_tuple = (ph[-2], ph[-1], round(feats['recent_p_ratio'], 1), round(feats['volatility'], 1))
@@ -185,11 +206,10 @@ class MLConcordanceAI:
             preds['RL'] = max(q_values, key=q_values.get) if q_values else random.choice(['P','B'])
         else: preds['RL'] = None
 
-        game_phase = self.pattern_detector.detect(self.game_history)
+        game_phase = pattern_detector.detect(self.game_history, custom_window=feature_win)
         self.last_game_phase = game_phase
 
         dynamic_weights = self.combiner.weights.copy()
-        
         phase_experts = self.expertise_matrix[game_phase]
         for model_name, stats in phase_experts.items():
             if stats['total'] > 5:
@@ -206,15 +226,19 @@ class MLConcordanceAI:
             final_prediction = preds.get('LGBM', 'B')
         else:
             final_prediction = 'P' if votes['P'] > votes['B'] else 'B'
-        
+
         hit_val = 1 if self.last_bet_result is True else 0
         if self.drift.add(hit_val) and self.consecutive_miss >= 4:
             self.rl_mode = False; self.q_table.clear()
 
         winning_strats = {s: dynamic_weights.get(s, 0) for s, p in preds.items() if p == final_prediction}
         strategy = max(winning_strats, key=winning_strats.get) if winning_strats else None
-        
-        self.analysis_text = f"AI 예측: [Phase: {game_phase}] [Expert -> {strategy if strategy else 'Vote'}] ➡️ {final_prediction}"
+
+        # --- ALT 모드 시 안내문 ---
+        if self.alt_mode:
+            self.analysis_text = f"[AI: 패턴 재정렬모드] [Expert -> {strategy if strategy else 'Vote'}] ➡️ {final_prediction}"
+        else:
+            self.analysis_text = f"AI 예측: [Phase: {game_phase}] [Expert -> {strategy if strategy else 'Vote'}] ➡️ {final_prediction}"
         self.last_preds = preds
         self.next_prediction = final_prediction
         self.last_strategy = strategy
@@ -251,6 +275,25 @@ class MLConcordanceAI:
                     reward = 1 if hit else -1; q = self.q_table[state_tuple]
                     next_q_val = max(q.values()) if q else 0
                     q[self.next_prediction] = q.get(self.next_prediction,0) + 0.1 * (reward + 0.9 * next_q_val - q.get(self.next_prediction,0))
+
+                # ALT모드 평가: 2연속 실패시 원복
+                if self.alt_mode:
+                    self.alt_mode_count += 1
+                    if not hit:
+                        self.alt_miss_count += 1
+                    # ALT모드 2회 모두 실패면 원복
+                    if self.alt_mode_count >= 2:
+                        if self.alt_miss_count >= 2:
+                            self.alt_mode = False
+                            self.alt_mode_count = 0
+                            self.alt_miss_count = 0
+                            self.analysis_text += " [AI: 재정렬 2회 실패, 원래 모드로 복귀]"
+                        else:
+                            # 1회라도 성공시 ALT모드 유지 or 바로 원복(옵션)
+                            self.alt_mode = False
+                            self.alt_mode_count = 0
+                            self.alt_miss_count = 0
+
                 self.last_bet_result = hit
             else:
                 self.hit_record.append(None)
