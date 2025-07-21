@@ -1,509 +1,147 @@
-import os
-import random
-import time
-from collections import Counter, defaultdict, deque
 import pandas as pd
 import joblib
-import numpy as np
+from collections import Counter
 from sklearn.linear_model import SGDClassifier
+import numpy as np
 
-# --- 패턴 감지기 클래스 ---
-class PatternDetector:
-    def __init__(self, window_size=20, trend_threshold=0.6, chop_threshold=0.6):
-        self.window_size = window_size
-        self.trend_threshold = trend_threshold
-        self.chop_threshold = chop_threshold
-
-    def detect(self, history):
-        pb_history = [r for r in history if r in 'PB']
-        if len(pb_history) < self.window_size:
-            return 'NEUTRAL'
-        window = pb_history[-self.window_size:]
-        trend_count = sum(1 for i in range(1, len(window)) if window[i] == window[i-1])
-        total_transitions = len(window) - 1
-        if total_transitions == 0: return 'NEUTRAL'
-        trend_ratio = trend_count / total_transitions
-        chop_ratio = 1 - trend_ratio
-        if trend_ratio >= self.trend_threshold:
-            return 'TRENDING'
-        elif chop_ratio >= self.chop_threshold:
-            return 'CHOPPY'
-        else:
-            return 'NEUTRAL'
-
-# --- 특징(Feature) 추출 함수 ---
+# --- 헬퍼 클래스 및 함수 정의 (이전과 동일) ---
 def create_features(history):
     features = {}
     pb_history = [r for r in history if r in 'PB']
-    if len(pb_history) < 6:
-        return None
+    if len(pb_history) < 13: return None
     window = pb_history[-10:]
-    if len(window) < 2: return None
     features['recent_p_ratio'] = window.count('P') / len(window)
     features['volatility'] = sum(1 for i in range(1, len(window)) if window[i] != window[i-1]) / (len(window)-1)
-    grams2 = ''.join(pb_history[-2:])
-    grams3 = ''.join(pb_history[-3:])
+    grams2, grams3 = ''.join(pb_history[-2:]), ''.join(pb_history[-3:])
     for g in ['PP','PB','BP','BB']: features[f'2_gram_{g}'] = int(grams2 == g)
     for g in ['PPP','PPB','PBP','PBB','BPP','BPB','BBP','BBB']: features[f'3_gram_{g}'] = int(grams3 == g)
+    last_4, last_6 = ''.join(pb_history[-4:]), ''.join(pb_history[-6:])
+    features['is_3_1_pattern'] = 1 if last_4 in ['PPPB', 'BBBP'] else 0
+    features['is_3_3_pattern'] = 1 if last_6 in ['PPPBBB', 'BBBPPP'] else 0
     return features
 
-# --- 지수평활 ---
-class ExpSmoother:
-    def __init__(self, alpha=0.3):
-        self.alpha = alpha
-        self.ema = None
-    def update(self, value):
-        if self.ema is None: self.ema = value
-        else: self.ema = self.alpha * value + (1 - self.alpha) * self.ema
-        return self.ema
-
-# --- 컨셉 드리프트 감지 ---
-class DriftDetector:
-    def __init__(self, windows=(10,50), threshold=0.2):
-        self.deques = [deque(maxlen=w) for w in windows]
-        self.threshold = threshold
-    def add(self, value):
-        drifted = False
-        for dq in self.deques:
-            dq.append(value)
-            if len(dq) == dq.maxlen:
-                mid = dq.maxlen//2
-                if abs(np.mean(list(dq)[:mid]) - np.mean(list(dq)[mid:])) > self.threshold:
-                    drifted = True
-        return drifted
-
-# --- 중국점 헬퍼 ---
-def calc_big_road(history):
-    road, prev = [], None
-    for r in [h for h in history if h in 'PB']:
-        if prev is None or r != prev: road.append([r])
-        else: road[-1].append(r)
-        prev = r
-    return road
-
-def calc_derived_road(big_road, offset):
-    derived = []
-    for i in range(offset, len(big_road)):
-        derived.append('P' if len(big_road[i]) == len(big_road[i-offset]) else 'B')
-    return derived
-
-# --- 가중치 앙상블 ---
 class WeightedMajorityCombiner:
-    def __init__(self, beta=0.95, min_beta=0.5, decay=0.99):
-        self.beta, self.min_beta, self.decay = beta, min_beta, decay
-        self.weights = {s:1.0 for s in ['ML','LGBM','Rule','RL','EMA']}
-        self.loss_count = 0
-    def update(self, preds, actual, hit):
-        if not hit:
-            self.loss_count += 1
-            if self.loss_count % 3 == 0: self.beta = max(self.beta * self.decay, self.min_beta)
-        else: self.loss_count = 0
+    def __init__(self, strategies, beta=0.95):
+        self.beta, self.weights = beta, {s: 1.0 for s in strategies}
+    def predict(self, preds):
+        votes = {'P': 0.0, 'B': 0.0}
         for strat, p in preds.items():
-            if p in ('P','B') and p != actual: self.weights[strat] *= self.beta
+            if p in votes: votes[p] += self.weights.get(strat, 1.0)
+        if votes['P'] == votes['B']: return preds.get('LGBM')
+        return 'P' if votes['P'] > votes['B'] else 'B'
+    def update(self, preds, actual, hit):
+        for strat, p in preds.items():
+            if p in ('P', 'B') and p != actual: self.weights[strat] *= self.beta
         total = sum(self.weights.values())
         if total > 1e-9:
             for strat in self.weights: self.weights[strat] /= total
 
-# ---------- 통합 AI 클래스 ----------
+# ---------- 통합 AI 클래스 (최종 진화 버전) ----------
 class MLConcordanceAI:
-    def __init__(self, model_path='baccarat_model.joblib',
-                 lgbm_model_path='baccarat_lgbm_model.joblib'):
+    def __init__(self, lgbm_model_path='baccarat_lgbm_model.joblib',
+                 chaos_model_path='baccarat_chaos_model.joblib'):
         self.history, self.game_history, self.hit_record = [], [], []
-        self.bet_count, self.correct, self.incorrect = 0, 0, 0
-        self.current_win, self.max_win, self.current_loss, self.max_loss = 0, 0, 0, 0
-        self.last_bet_result = None
-        self.analysis_text = "AI: 초기 데이터 수집 중..."
-        self.next_prediction, self.should_bet_now = None, False
-        self.rl_mode, self.consecutive_miss = False, 0
-        self.q_table = defaultdict(lambda:{'P':0.0,'B':0.0})
-
-        self.model = joblib.load(model_path)
+        self.bet_count, self.correct, self.max_win, self.max_loss, self.current_win, self.current_loss = 0, 0, 0, 0, 0, 0
+        self.analysis_text, self.next_prediction, self.should_bet_now = "AI 초기화 중...", None, False
+        
         self.lgbm_model = joblib.load(lgbm_model_path)
-        
-        self.exp_smoother = ExpSmoother(alpha=0.2)
-        self.drift = DriftDetector(windows=(10,50), threshold=0.2)
-        self.combiner = WeightedMajorityCombiner(beta=0.95, min_beta=0.5, decay=0.99)
-        self.pattern_detector = PatternDetector()
-        
-        self.expertise_matrix = {
-            'TRENDING': {model: {'correct': 0, 'total': 0} for model in self.combiner.weights.keys()},
-            'CHOPPY': {model: {'correct': 0, 'total': 0} for model in self.combiner.weights.keys()},
-            'NEUTRAL': {model: {'correct': 0, 'total': 0} for model in self.combiner.weights.keys()}
-        }
-        self.last_game_phase = 'NEUTRAL'
-        
-        self.last_preds = {s:None for s in self.combiner.weights.keys()}
-        self.last_strategy = None
+        self.chaos_model = joblib.load(chaos_model_path)
+        self.online_model = SGDClassifier(loss='log_loss', random_state=42)
+        self.online_model_ready, self.last_features = False, None
+        self.combiner = WeightedMajorityCombiner(strategies=['LGBM', 'Online'])
+        self.last_preds = {}
+
+        # --- [신규] 전략 AI를 위한 기록부 ---
+        self.mode_performance_history = []
+        self.last_mode_for_bet = "안정"
+        # --------------------------------
+
         self.predict_next()
 
-    def rule_predict(self):
-        ph = [h for h in self.game_history if h in 'PB']
-        votes = []
-        if len(ph)>=2 and ph[-1]==ph[-2]: votes.append(ph[-1])
-        br = calc_big_road(self.game_history)
-        for off in (1,2,3):
-            dr = calc_derived_road(br, off)
-            if dr: votes.append(dr[-1])
-        return Counter(votes).most_common(1)[0][0] if votes else None
-        
-    def predict_next(self):
-        ph = [h for h in self.game_history if h in 'PB']
-        if len(ph) < 6:
-            self.analysis_text, self.should_bet_now = "AI: 초기 데이터 수집 중...", False
-            return
-
-        preds = {}
-        ema_val = self.exp_smoother.update(1 if ph[-1]=='P' else 0)
-        preds['EMA'] = 'P' if ema_val > 0.5 else 'B'
-        
-        feats = create_features(self.game_history)
-        if feats:
-            df_for_predict = pd.DataFrame([feats])
-            preds['ML'] = self.model.predict(df_for_predict)[0]
-            preds['LGBM'] = self.lgbm_model.predict(df_for_predict)[0]
-        else:
-            preds['ML'], preds['LGBM'] = None, None
-        
-        preds['Rule'] = self.rule_predict()
-        if self.current_loss >= 3: self.rl_mode = True
-        if self.rl_mode and feats:
-            state_tuple = (ph[-2], ph[-1], round(feats['recent_p_ratio'], 1), round(feats['volatility'], 1))
-            q_values = self.q_table[state_tuple]
-            preds['RL'] = max(q_values, key=q_values.get) if q_values else random.choice(['P','B'])
-        else: preds['RL'] = None
-
-        game_phase = self.pattern_detector.detect(self.game_history)
-        self.last_game_phase = game_phase
-        dynamic_weights = self.combiner.weights.copy()
-        
-        phase_experts = self.expertise_matrix[game_phase]
-        for model_name, stats in phase_experts.items():
-            if stats['total'] > 5:
-                accuracy = stats['correct'] / stats['total']
-                boost_factor = 1 + (accuracy - 0.5)
-                dynamic_weights[model_name] *= boost_factor
-        
-        votes = {'P': 0.0, 'B': 0.0}
-        for strat, p in preds.items():
-            if p in votes: votes[p] += dynamic_weights.get(strat, 1.0)
-        
-        if votes['P'] == votes['B']: final_prediction = preds.get('LGBM', 'B')
-        else: final_prediction = 'P' if votes['P'] > votes['B'] else 'B'
-        
-        hit_val = 1 if self.last_bet_result is True else 0
-        if self.drift.add(hit_val) and self.consecutive_miss >= 4:
-            self.rl_mode = False; self.q_table.clear()
-
-        winning_strats = {s: dynamic_weights.get(s, 0) for s, p in preds.items() if p == final_prediction}
-        strategy = max(winning_strats, key=winning_strats.get) if winning_strats else None
-        
-        # --- '안티-로직' 적용 ---
-        ANTI_LOGIC_THRESHOLD = 3
-        if self.current_loss >= ANTI_LOGIC_THRESHOLD and final_prediction is not None:
-            final_prediction = 'B' if final_prediction == 'P' else 'P'
-            self.analysis_text = f"🚨 {self.current_loss}연패 감지! 안티-로직 발동 ➡️ {final_prediction}"
-        else:
-            self.analysis_text = f"AI 예측: [Phase: {game_phase}] [Expert -> {strategy if strategy else 'Vote'}] ➡️ {final_prediction}"
-        # --- 로직 종료 ---
-        
-        self.last_preds = preds
-        self.next_prediction = final_prediction
-        self.last_strategy = strategy
-        self.should_bet_now = (final_prediction is not None)
+    def _calculate_chaos_index(self):
+        recent_bet_results = [h for h in self.hit_record[-15:] if h is not None]
+        if len(recent_bet_results) < 10: return 0.0
+        numeric_results = [1 if r == 'O' else 0 for r in recent_bet_results]
+        chaos = np.std(numeric_results) * 2
+        return chaos
 
     def handle_input(self, result):
-        prev_game_history = [h for h in self.game_history if h in 'PB']
-        if result == 'T':
-            self.history.append('T'); self.hit_record.append(None); self.analysis_text = "AI: TIE, 베팅 스킵."
+        if result == 'T': self.history.append('T'); self.hit_record.append(None)
         else:
             if self.should_bet_now:
                 hit = (self.next_prediction == result)
                 self.bet_count += 1
-                if hit:
-                    self.correct += 1; self.current_win += 1; self.current_loss = 0; self.consecutive_miss = 0
-                    self.max_win = max(self.max_win, self.current_win)
-                else:
-                    self.incorrect += 1; self.current_win = 0; self.current_loss += 1; self.consecutive_miss += 1
-                    self.max_loss = max(self.max_loss, self.current_loss)
+                
+                # [신규] 전략 AI가 학습할 수 있도록, 어떤 모드의 예측이었고 결과가 어땠는지 기록
+                self.mode_performance_history.append(f"{self.last_mode_for_bet}-{'O' if hit else 'X'}")
+
+                if self.last_mode_for_bet == "안정":
+                    self.combiner.update(self.last_preds, result, hit)
+                
+                if self.last_features:
+                    self.online_model.partial_fit(pd.DataFrame([self.last_features]), [result], classes=['P','B'])
+                    self.online_model_ready = True
+
+                if hit: self.correct += 1; self.current_win += 1; self.current_loss = 0
+                else: self.current_win = 0; self.current_loss += 1
+                self.max_win = max(self.max_win, self.current_win)
+                self.max_loss = max(self.max_loss, self.current_loss)
                 self.hit_record.append('O' if hit else 'X')
-                self.combiner.update(self.last_preds, result, hit)
-
-                phase = self.last_game_phase 
-                for model_name, prediction in self.last_preds.items():
-                    if prediction in ['P', 'B']:
-                        self.expertise_matrix[phase][model_name]['total'] += 1
-                        if prediction == result: self.expertise_matrix[phase][model_name]['correct'] += 1
-
-                update_feats = create_features(prev_game_history)
-                if self.last_strategy == 'RL' and update_feats:
-                    state_tuple = (prev_game_history[-2], prev_game_history[-1], round(update_feats['recent_p_ratio'], 1), round(update_feats['volatility'], 1))
-                    reward = 1 if hit else -1; q = self.q_table[state_tuple]
-                    next_q_val = max(q.values()) if q else 0
-                    q[self.next_prediction] = q.get(self.next_prediction,0) + 0.1 * (reward + 0.9 * next_q_val - q.get(self.next_prediction,0))
-                self.last_bet_result = hit
             else:
                 self.hit_record.append(None)
-            self.history.append(result)
-            self.game_history.append(result)
-        self.predict_next()
-        
-    def get_stats(self):
-        accuracy = (self.correct / self.bet_count * 100) if self.bet_count > 0 else 0
-        return {
-            "총입력": len(self.history), "베팅횟수": self.bet_count, "적중률(%)": f"{accuracy:.2f}",
-            "현재연승": self.current_win, "최대연승": self.max_win, "현재연패": self.current_loss, "최대연패": self.max_loss
-        }import os
-import random
-import time
-from collections import Counter, defaultdict, deque
-import pandas as pd
-import joblib
-import numpy as np
-from sklearn.linear_model import SGDClassifier
-
-# --- 패턴 감지기 클래스 ---
-class PatternDetector:
-    def __init__(self, window_size=20, trend_threshold=0.6, chop_threshold=0.6):
-        self.window_size = window_size
-        self.trend_threshold = trend_threshold
-        self.chop_threshold = chop_threshold
-
-    def detect(self, history):
-        pb_history = [r for r in history if r in 'PB']
-        if len(pb_history) < self.window_size:
-            return 'NEUTRAL'
-        window = pb_history[-self.window_size:]
-        trend_count = sum(1 for i in range(1, len(window)) if window[i] == window[i-1])
-        total_transitions = len(window) - 1
-        if total_transitions == 0: return 'NEUTRAL'
-        trend_ratio = trend_count / total_transitions
-        chop_ratio = 1 - trend_ratio
-        if trend_ratio >= self.trend_threshold:
-            return 'TRENDING'
-        elif chop_ratio >= self.chop_threshold:
-            return 'CHOPPY'
-        else:
-            return 'NEUTRAL'
-
-# --- 특징(Feature) 추출 함수 ---
-def create_features(history):
-    features = {}
-    pb_history = [r for r in history if r in 'PB']
-    if len(pb_history) < 6:
-        return None
-    window = pb_history[-10:]
-    if len(window) < 2: return None
-    features['recent_p_ratio'] = window.count('P') / len(window)
-    features['volatility'] = sum(1 for i in range(1, len(window)) if window[i] != window[i-1]) / (len(window)-1)
-    grams2 = ''.join(pb_history[-2:])
-    grams3 = ''.join(pb_history[-3:])
-    for g in ['PP','PB','BP','BB']: features[f'2_gram_{g}'] = int(grams2 == g)
-    for g in ['PPP','PPB','PBP','PBB','BPP','BPB','BBP','BBB']: features[f'3_gram_{g}'] = int(grams3 == g)
-    return features
-
-# --- 지수평활 ---
-class ExpSmoother:
-    def __init__(self, alpha=0.3):
-        self.alpha = alpha
-        self.ema = None
-    def update(self, value):
-        if self.ema is None: self.ema = value
-        else: self.ema = self.alpha * value + (1 - self.alpha) * self.ema
-        return self.ema
-
-# --- 컨셉 드리프트 감지 ---
-class DriftDetector:
-    def __init__(self, windows=(10,50), threshold=0.2):
-        self.deques = [deque(maxlen=w) for w in windows]
-        self.threshold = threshold
-    def add(self, value):
-        drifted = False
-        for dq in self.deques:
-            dq.append(value)
-            if len(dq) == dq.maxlen:
-                mid = dq.maxlen//2
-                if abs(np.mean(list(dq)[:mid]) - np.mean(list(dq)[mid:])) > self.threshold:
-                    drifted = True
-        return drifted
-
-# --- 중국점 헬퍼 ---
-def calc_big_road(history):
-    road, prev = [], None
-    for r in [h for h in history if h in 'PB']:
-        if prev is None or r != prev: road.append([r])
-        else: road[-1].append(r)
-        prev = r
-    return road
-
-def calc_derived_road(big_road, offset):
-    derived = []
-    for i in range(offset, len(big_road)):
-        derived.append('P' if len(big_road[i]) == len(big_road[i-offset]) else 'B')
-    return derived
-
-# --- 가중치 앙상블 ---
-class WeightedMajorityCombiner:
-    def __init__(self, beta=0.95, min_beta=0.5, decay=0.99):
-        self.beta, self.min_beta, self.decay = beta, min_beta, decay
-        self.weights = {s:1.0 for s in ['ML','LGBM','Rule','RL','EMA']}
-        self.loss_count = 0
-    def update(self, preds, actual, hit):
-        if not hit:
-            self.loss_count += 1
-            if self.loss_count % 3 == 0: self.beta = max(self.beta * self.decay, self.min_beta)
-        else: self.loss_count = 0
-        for strat, p in preds.items():
-            if p in ('P','B') and p != actual: self.weights[strat] *= self.beta
-        total = sum(self.weights.values())
-        if total > 1e-9:
-            for strat in self.weights: self.weights[strat] /= total
-
-# ---------- 통합 AI 클래스 ----------
-class MLConcordanceAI:
-    def __init__(self, model_path='baccarat_model.joblib',
-                 lgbm_model_path='baccarat_lgbm_model.joblib'):
-        self.history, self.game_history, self.hit_record = [], [], []
-        self.bet_count, self.correct, self.incorrect = 0, 0, 0
-        self.current_win, self.max_win, self.current_loss, self.max_loss = 0, 0, 0, 0
-        self.last_bet_result = None
-        self.analysis_text = "AI: 초기 데이터 수집 중..."
-        self.next_prediction, self.should_bet_now = None, False
-        self.rl_mode, self.consecutive_miss = False, 0
-        self.q_table = defaultdict(lambda:{'P':0.0,'B':0.0})
-
-        self.model = joblib.load(model_path)
-        self.lgbm_model = joblib.load(lgbm_model_path)
-        
-        self.exp_smoother = ExpSmoother(alpha=0.2)
-        self.drift = DriftDetector(windows=(10,50), threshold=0.2)
-        self.combiner = WeightedMajorityCombiner(beta=0.95, min_beta=0.5, decay=0.99)
-        self.pattern_detector = PatternDetector()
-        
-        self.expertise_matrix = {
-            'TRENDING': {model: {'correct': 0, 'total': 0} for model in self.combiner.weights.keys()},
-            'CHOPPY': {model: {'correct': 0, 'total': 0} for model in self.combiner.weights.keys()},
-            'NEUTRAL': {model: {'correct': 0, 'total': 0} for model in self.combiner.weights.keys()}
-        }
-        self.last_game_phase = 'NEUTRAL'
-        
-        self.last_preds = {s:None for s in self.combiner.weights.keys()}
-        self.last_strategy = None
+            self.history.append(result); self.game_history.append(result)
         self.predict_next()
 
-    def rule_predict(self):
-        ph = [h for h in self.game_history if h in 'PB']
-        votes = []
-        if len(ph)>=2 and ph[-1]==ph[-2]: votes.append(ph[-1])
-        br = calc_big_road(self.game_history)
-        for off in (1,2,3):
-            dr = calc_derived_road(br, off)
-            if dr: votes.append(dr[-1])
-        return Counter(votes).most_common(1)[0][0] if votes else None
-        
     def predict_next(self):
-        ph = [h for h in self.game_history if h in 'PB']
-        if len(ph) < 6:
-            self.analysis_text, self.should_bet_now = "AI: 초기 데이터 수집 중...", False
+        pb_history = [r for r in self.game_history if r in 'PB']
+        if len(pb_history) < 13:
+            self.analysis_text, self.should_bet_now = "AI가 패턴을 학습하고 있습니다...", False
             return
+        
+        chaos_index = self._calculate_chaos_index()
+        final_prediction, mode = None, "안정"
+        features = create_features(self.game_history)
+        self.last_features = features
+        
+        # 1. 혼돈 지수에 따른 1차 모드 결정
+        CHAOS_THRESHOLD = 0.8
+        if chaos_index >= CHAOS_THRESHOLD:
+            mode = "혼돈"
+        
+        # --- [신규] 전략 AI의 최종 판단 ---
+        strategist_override = False
+        if len(self.mode_performance_history) >= 3:
+            # 최근 3번의 모드 성과를 분석
+            last_3_modes = self.mode_performance_history[-3:]
+            # 만약 안정 모드가 3연패 중이라면, 강제로 혼돈 모드로 변경
+            if last_3_modes == ['안정-X', '안정-X', '안정-X'] and mode == "안정":
+                mode = "혼돈"
+                strategist_override = True
+            # 만약 혼돈 모드가 3연패 중이라면, 강제로 안정 모드로 변경
+            elif last_3_modes == ['혼돈-X', '혼돈-X', '혼돈-X'] and mode == "혼돈":
+                mode = "안정"
+                strategist_override = True
+        # --------------------------------
 
-        preds = {}
-        ema_val = self.exp_smoother.update(1 if ph[-1]=='P' else 0)
-        preds['EMA'] = 'P' if ema_val > 0.5 else 'B'
+        # 2. 최종 결정된 모드에 따라 예측 수행
+        if mode == "혼돈" and features:
+            final_prediction = self.chaos_model.predict(pd.DataFrame([features]))[0]
+        elif mode == "안정" and features:
+            preds = {}
+            preds['LGBM'] = self.lgbm_model.predict(pd.DataFrame([features]))[0]
+            if self.online_model_ready:
+                preds['Online'] = self.online_model.predict(pd.DataFrame([features]))[0]
+            if preds: final_prediction = self.combiner.predict(preds)
+            self.last_preds = preds
         
-        feats = create_features(self.game_history)
-        if feats:
-            df_for_predict = pd.DataFrame([feats])
-            preds['ML'] = self.model.predict(df_for_predict)[0]
-            preds['LGBM'] = self.lgbm_model.predict(df_for_predict)[0]
-        else:
-            preds['ML'], preds['LGBM'] = None, None
-        
-        preds['Rule'] = self.rule_predict()
-        if self.current_loss >= 3: self.rl_mode = True
-        if self.rl_mode and feats:
-            state_tuple = (ph[-2], ph[-1], round(feats['recent_p_ratio'], 1), round(feats['volatility'], 1))
-            q_values = self.q_table[state_tuple]
-            preds['RL'] = max(q_values, key=q_values.get) if q_values else random.choice(['P','B'])
-        else: preds['RL'] = None
-
-        game_phase = self.pattern_detector.detect(self.game_history)
-        self.last_game_phase = game_phase
-        dynamic_weights = self.combiner.weights.copy()
-        
-        phase_experts = self.expertise_matrix[game_phase]
-        for model_name, stats in phase_experts.items():
-            if stats['total'] > 5:
-                accuracy = stats['correct'] / stats['total']
-                boost_factor = 1 + (accuracy - 0.5)
-                dynamic_weights[model_name] *= boost_factor
-        
-        votes = {'P': 0.0, 'B': 0.0}
-        for strat, p in preds.items():
-            if p in votes: votes[p] += dynamic_weights.get(strat, 1.0)
-        
-        if votes['P'] == votes['B']: final_prediction = preds.get('LGBM', 'B')
-        else: final_prediction = 'P' if votes['P'] > votes['B'] else 'B'
-        
-        hit_val = 1 if self.last_bet_result is True else 0
-        if self.drift.add(hit_val) and self.consecutive_miss >= 4:
-            self.rl_mode = False; self.q_table.clear()
-
-        winning_strats = {s: dynamic_weights.get(s, 0) for s, p in preds.items() if p == final_prediction}
-        strategy = max(winning_strats, key=winning_strats.get) if winning_strats else None
-        
-        # --- '안티-로직' 적용 ---
-        ANTI_LOGIC_THRESHOLD = 3
-        if self.current_loss >= ANTI_LOGIC_THRESHOLD and final_prediction is not None:
-            final_prediction = 'B' if final_prediction == 'P' else 'P'
-            self.analysis_text = f"🚨 {self.current_loss}연패 감지! 안티-로직 발동 ➡️ {final_prediction}"
-        else:
-            self.analysis_text = f"AI 예측: [Phase: {game_phase}] [Expert -> {strategy if strategy else 'Vote'}] ➡️ {final_prediction}"
-        # --- 로직 종료 ---
-        
-        self.last_preds = preds
         self.next_prediction = final_prediction
-        self.last_strategy = strategy
         self.should_bet_now = (final_prediction is not None)
-
-    def handle_input(self, result):
-        prev_game_history = [h for h in self.game_history if h in 'PB']
-        if result == 'T':
-            self.history.append('T'); self.hit_record.append(None); self.analysis_text = "AI: TIE, 베팅 스킵."
-        else:
-            if self.should_bet_now:
-                hit = (self.next_prediction == result)
-                self.bet_count += 1
-                if hit:
-                    self.correct += 1; self.current_win += 1; self.current_loss = 0; self.consecutive_miss = 0
-                    self.max_win = max(self.max_win, self.current_win)
-                else:
-                    self.incorrect += 1; self.current_win = 0; self.current_loss += 1; self.consecutive_miss += 1
-                    self.max_loss = max(self.max_loss, self.current_loss)
-                self.hit_record.append('O' if hit else 'X')
-                self.combiner.update(self.last_preds, result, hit)
-
-                phase = self.last_game_phase 
-                for model_name, prediction in self.last_preds.items():
-                    if prediction in ['P', 'B']:
-                        self.expertise_matrix[phase][model_name]['total'] += 1
-                        if prediction == result: self.expertise_matrix[phase][model_name]['correct'] += 1
-
-                update_feats = create_features(prev_game_history)
-                if self.last_strategy == 'RL' and update_feats:
-                    state_tuple = (prev_game_history[-2], prev_game_history[-1], round(update_feats['recent_p_ratio'], 1), round(update_feats['volatility'], 1))
-                    reward = 1 if hit else -1; q = self.q_table[state_tuple]
-                    next_q_val = max(q.values()) if q else 0
-                    q[self.next_prediction] = q.get(self.next_prediction,0) + 0.1 * (reward + 0.9 * next_q_val - q.get(self.next_prediction,0))
-                self.last_bet_result = hit
-            else:
-                self.hit_record.append(None)
-            self.history.append(result)
-            self.game_history.append(result)
-        self.predict_next()
+        self.last_mode_for_bet = mode # 베팅 시점의 모드를 기록
         
+        override_note = " (전략 AI 개입)" if strategist_override else ""
+        self.analysis_text = f"AI 분석: [국면: {mode}{override_note} / 혼돈지수: {chaos_index:.0%}] ➡️ {self.next_prediction}"
+
     def get_stats(self):
         accuracy = (self.correct / self.bet_count * 100) if self.bet_count > 0 else 0
-        return {
-            "총입력": len(self.history), "베팅횟수": self.bet_count, "적중률(%)": f"{accuracy:.2f}",
-            "현재연승": self.current_win, "최대연승": self.max_win, "현재연패": self.current_loss, "최대연패": self.max_loss
-        }
+        return {"총입력": len(self.history), "베팅횟수": self.bet_count, "적중률(%)": f"{accuracy:.2f}",
+                "현재연승": self.current_win, "최대연승": self.max_win, "현재연패": self.current_loss, "최대연패": self.max_loss}
