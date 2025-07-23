@@ -28,7 +28,7 @@ def create_features(game_history, shoe_history):
     if len(pb_history) < 13:
         return None
 
-    # --- 단기 특징 ---
+    # 단기 특징
     window = pb_history[-10:]
     features['recent_p_ratio'] = window.count('P') / len(window) if len(window) > 0 else 0.5
     features['volatility'] = sum(1 for i in range(1, len(window)) if window[i] != window[i-1]) / (len(window)-1) if len(window) > 1 else 0
@@ -39,7 +39,7 @@ def create_features(game_history, shoe_history):
     features['is_3_1_pattern'] = 1 if last_4 in ['PPPB', 'BBBP'] else 0
     features['is_3_3_pattern'] = 1 if last_6 in ['PPPBBB', 'BBBPPP'] else 0
     
-    # --- 슈(Shoe) 전체 장기 특징 ---
+    # 슈(Shoe) 전체 장기 특징
     shoe_pb_history = [r for r in shoe_history if r in 'PB']
     if len(shoe_pb_history) > 0:
         features['shoe_p_ratio'] = shoe_pb_history.count('P') / len(shoe_pb_history)
@@ -49,10 +49,8 @@ def create_features(game_history, shoe_history):
         features['longest_b_streak_in_shoe'] = longest_b
         features['game_position_in_shoe'] = len(shoe_pb_history) / 80.0
     else:
-        features['shoe_p_ratio'] = 0.5
-        features['shoe_b_ratio'] = 0.5
-        features['longest_p_streak_in_shoe'] = 0
-        features['longest_b_streak_in_shoe'] = 0
+        features['shoe_p_ratio'] = 0.5; features['shoe_b_ratio'] = 0.5
+        features['longest_p_streak_in_shoe'] = 0; features['longest_b_streak_in_shoe'] = 0
         features['game_position_in_shoe'] = 0.0
         
     return features
@@ -65,13 +63,11 @@ class WeightedMajorityCombiner:
         votes = {'P': 0.0, 'B': 0.0}
         for strat, p in preds.items():
             if p in votes: votes[p] += self.weights.get(strat, 1.0)
-        
-        # 가중치 투표 결과가 동률일 경우, LGBM > Flow > Online 우선순위로 결정
         if votes['P'] == votes['B']:
             if 'LGBM' in preds: return preds['LGBM']
             if 'Flow' in preds: return preds['Flow']
             if 'Online' in preds: return preds['Online']
-            return None # 모든 예측이 없는 경우
+            return None
         return 'P' if votes['P'] > votes['B'] else 'B'
     def update(self, preds, actual, hit):
         for strat, p in preds.items():
@@ -80,72 +76,73 @@ class WeightedMajorityCombiner:
         if total > 1e-9:
             for strat in self.weights: self.weights[strat] /= total
 
-# --- [업그레이드] 통계적 흐름 분석 함수 ---
+# --- [최종 업그레이드] 통계적 흐름 분석 알고리즘 ---
 def analyze_statistical_flow(shoe_pb_history):
     """
-    슈 전체의 통계적 흐름을 분석하여 P/B를 예측합니다.
+    슈 전체의 통계적 흐름을 동적으로 분석하여 P/B를 예측합니다.
+    - 동적 임계값, 교차(퐁당퐁당) 패턴 감지 기능 추가
     """
-    if len(shoe_pb_history) < 20: # 최소 20게임 데이터가 쌓여야 분석 의미가 있음
+    total_games = len(shoe_pb_history)
+    if total_games < 20:
         return None, "[흐름분석: 데이터 축적 중]"
 
     p_count = shoe_pb_history.count('P')
     b_count = shoe_pb_history.count('B')
     
-    # 1. P-B 격차 계산
+    # 1. 지표 계산
     gap = p_count - b_count
-    
-    # 2. 격차 모멘텀 계산 (최근 15게임)
-    window = shoe_pb_history[-15:]
-    momentum_gap = window.count('P') - window.count('B')
+    recent_window = shoe_pb_history[-20:] # 분석창 확장
+    momentum = recent_window.count('P') - recent_window.count('B')
+    chop_index = sum(1 for i in range(1, len(recent_window)) if recent_window[i] != recent_window[i-1]) / (len(recent_window) - 1)
 
+    # 2. 동적 임계값 설정
+    # 게임이 진행될수록 '팽팽하다'고 판단하는 격차의 범위를 넓힘
+    tension_threshold = max(4, total_games // 10) 
+    
     # 3. 국면 진단 및 예측 로직
     phase = ""
     prediction = None
 
-    if abs(gap) <= 3:
-        phase = "팽팽한 접전"
-        # 직전 결과의 반대에 베팅 (균형 회귀 전략)
+    # [규칙 1] 교차(퐁당퐁당) 패턴이 강하면, 반대로 베팅
+    if chop_index > 0.65:
+        phase = "뚜렷한 교차 국면"
         prediction = 'B' if shoe_pb_history[-1] == 'P' else 'P'
-            
-    elif gap > 3 and momentum_gap > 1:
-        phase = "플레이어 강세"
-        # 흐름을 따라 P에 베팅
-        prediction = 'P'
-        
-    elif gap < -3 and momentum_gap < -1:
-        phase = "뱅커 강세"
-        # 흐름을 따라 B에 베팅
-        prediction = 'B'
-
-    elif (gap > 3 and momentum_gap < 0) or (gap < -3 and momentum_gap > 0):
+    # [규칙 2] 한쪽의 강세가 뚜렷하면, 흐름을 따라 베팅
+    elif abs(gap) > tension_threshold and np.sign(gap) == np.sign(momentum):
+        phase = "강력한 단일 흐름"
+        prediction = 'P' if gap > 0 else 'B'
+    # [규칙 3] 강세 속에서 반대 모멘텀이 감지되면, 새로운 흐름에 베팅
+    elif abs(gap) > tension_threshold and np.sign(gap) != np.sign(momentum) and abs(momentum) > 2:
         phase = "흐름 전환기"
-        # 새로운 모멘텀을 따라 베팅
-        prediction = 'P' if momentum_gap > 0 else 'B'
-    
+        prediction = 'P' if momentum > 0 else 'B'
+    # [규칙 4] 팽팽한 접전 상황
+    elif abs(gap) <= tension_threshold:
+        phase = "팽팽한 접전"
+        # 접전 중에는 강한 모멘텀이 나타날 때만 그 방향으로 베팅
+        if abs(momentum) >= 4:
+            prediction = 'P' if momentum > 0 else 'B'
+        else: # 약한 모멘텀일 경우 관망
+            prediction = None
     else:
         phase = "흐름 탐색 중"
-        prediction = None # 불확실한 경우 베팅하지 않음
+        prediction = None
 
-    analysis_text = f"[흐름분석: {phase} / 전체격차:{gap} / 모멘텀:{momentum_gap}]"
+    analysis_text = f"[흐름분석: {phase} / 격차:{gap} / 모멘텀:{momentum} / 교차율:{chop_index:.0%}]"
     return prediction, analysis_text
 
-# ---------- 통합 AI 클래스 (업그레이드 버전) ----------
+# ---------- 통합 AI 클래스 (최종 해결책 적용 버전) ----------
 class MLConcordanceAI:
     def __init__(self, lgbm_model_path='baccarat_lgbm_model.joblib',
                  chaos_model_path='baccarat_chaos_model.joblib'):
         self.lgbm_model = joblib.load(lgbm_model_path)
         self.chaos_model = joblib.load(chaos_model_path)
         self.online_model = SGDClassifier(loss='log_loss', random_state=42)
-        
-        # [업그레이드] 'Flow' 전략을 Combiner에 추가
         self.combiner = WeightedMajorityCombiner(strategies=['LGBM', 'Online', 'Flow'], initial_beta=0.95)
-        
         self.original_feature_names = [
             'recent_p_ratio', 'volatility', '2_gram_PP', '2_gram_PB', '2_gram_BP', '2_gram_BB',
             '3_gram_PPP', '3_gram_PPB', '3_gram_PBP', '3_gram_PBB', '3_gram_BPP', 
             '3_gram_BPB', '3_gram_BBP', '3_gram_BBB', 'is_3_1_pattern', 'is_3_3_pattern'
         ]
-
         self.chaos_threshold = 0.8
         self.shoe_history = []
         self.reset_game()
@@ -168,10 +165,17 @@ class MLConcordanceAI:
         numeric_results = [1 if r == 'O' else 0 for r in recent_bet_results]
         return min(np.std(numeric_results) * 2.0, 1.0)
 
+    # --- [해결책 1] 위기 대응 로직 수정 ---
     def _update_dynamic_parameters(self, chaos_index):
-        if self.current_loss >= 2: self.chaos_threshold = min(0.9, self.chaos_threshold + 0.05)
-        elif self.current_win >= 2: self.chaos_threshold = max(0.7, self.chaos_threshold - 0.05)
-        self.combiner.beta = 0.90 if chaos_index > 0.7 else 0.95
+        # 연패 시, 임계값을 낮춰 혼돈 모드에 더 민감하게 반응
+        if self.current_loss >= 2:
+            self.chaos_threshold = max(0.60, self.chaos_threshold - 0.05) # 임계값 하락
+        # 연승 시, 자신감을 갖고 임계값을 높여 안정 모드를 유지하려는 경향 강화
+        elif self.current_win >= 3:
+            self.chaos_threshold = min(0.90, self.chaos_threshold + 0.05) # 임계값 상승
+        
+        # 혼돈 지수가 높으면 조합기(Combiner)의 학습률을 더 공격적으로 조정
+        self.combiner.beta = 0.85 if chaos_index > 0.75 else 0.95
 
     def handle_input(self, result):
         if result == 'T': 
@@ -202,8 +206,7 @@ class MLConcordanceAI:
     def predict_next(self):
         pb_history = [r for r in self.game_history if r in 'PB']
         if len(pb_history) < 13:
-            self.analysis_text, self.should_bet_now = "AI가 패턴을 학습하고 있습니다...", False
-            return
+            self.analysis_text, self.should_bet_now = "AI가 패턴을 학습하고 있습니다...", False; return
         
         chaos_index = self._calculate_chaos_index()
         self._update_dynamic_parameters(chaos_index)
@@ -215,13 +218,17 @@ class MLConcordanceAI:
         features_for_pretrained = {k: all_features[k] for k in self.original_feature_names}
         df_for_pretrained = pd.DataFrame([features_for_pretrained])
         
-        # [업그레이드] 통계 흐름 분석 로직 호출
         shoe_pb_history = [r for r in self.shoe_history if r in 'PB']
         flow_prediction, flow_analysis_text = analyze_statistical_flow(shoe_pb_history)
 
         mode = "혼돈" if chaos_index >= self.chaos_threshold else "안정"
         
         strategist_override = False
+
+        # --- [해결책 2] 서킷 브레이커 도입 ---
+        if self.current_loss >= 5 and mode == "안정":
+            mode = "혼돈"; strategist_override = True
+        
         if len(self.mode_performance_history) >= 3:
             last_3 = self.mode_performance_history[-3:]
             if last_3 == ['안정-X']*3 and mode == "안정": mode = "혼돈"; strategist_override = True
@@ -231,15 +238,11 @@ class MLConcordanceAI:
         if mode == "혼돈":
             final_prediction = self.chaos_model.predict(df_for_pretrained)[0]
         elif mode == "안정":
-            preds = {}
-            preds['LGBM'] = self.lgbm_model.predict(df_for_pretrained)[0]
+            preds = {'LGBM': self.lgbm_model.predict(df_for_pretrained)[0]}
             if self.online_model_ready:
                 preds['Online'] = self.online_model.predict(pd.DataFrame([all_features]))[0]
-            
-            # [업그레이드] '흐름 분석' 전략의 예측값을 preds에 추가
             if flow_prediction:
                 preds['Flow'] = flow_prediction
-            
             if preds: final_prediction = self.combiner.predict(preds)
             self.last_preds = preds
         
@@ -247,15 +250,11 @@ class MLConcordanceAI:
         self.should_bet_now = (final_prediction is not None)
         self.last_mode_for_bet = mode
         
-        override_note = " (전략 AI 개입)" if strategist_override else ""
-        
-        # [업그레이드] 분석 텍스트에 흐름 분석 결과 추가
+        override_note = " (강제 개입)" if strategist_override else ""
         base_analysis = (f"AI 분석: [국면: {mode}{override_note} / "
                          f"혼돈지수: {chaos_index:.0%} / 임계값: {self.chaos_threshold:.0%}]")
         final_pred_text = f"➡️ 최종 예측: {self.next_prediction}" if self.next_prediction else "➡️ 최종 예측: 관망"
-        
         self.analysis_text = f"{base_analysis}\n{flow_analysis_text}\n{final_pred_text}"
-
 
     def get_stats(self):
         accuracy = (self.correct / self.bet_count * 100) if self.bet_count > 0 else 0
@@ -263,31 +262,22 @@ class MLConcordanceAI:
                 "현재연승": self.current_win, "최대연승": self.max_win, "현재연패": self.current_loss, "최대연패": self.max_loss}
 
 
-# --- 이 아래 부분은 AI를 실행하기 위한 예시 코드입니다. ---
-# 터미널에서 직접 실행할 때 사용하세요.
-
 if __name__ == '__main__':
-    # AI 모델 파일이 있는지 확인하세요.
-    # 예: baccarat_lgbm_model.joblib, baccarat_chaos_model.joblib
-    # 파일이 없다면 이 코드는 실행되지 않습니다.
     try:
         ai = MLConcordanceAI()
         print("="*50)
-        print("바카라 AI 예측 프로그램 (통계 흐름 분석 업그레이드 버전)")
+        print("바카라 AI 예측 프로그램 (최종 업그레이드 버전)")
         print("결과를 입력하세요 (P: 플레이어, B: 뱅커, T: 타이). '종료' 입력 시 종료.")
         print("="*50)
         
         while True:
             print("\n" + ai.analysis_text)
             print(f"통계: {ai.get_stats()}")
-            
             user_input = input("지난 게임 결과 입력: ").upper()
-            
             if user_input in ['P', 'B', 'T']:
                 ai.handle_input(user_input)
             elif user_input == '종료':
-                print("프로그램을 종료합니다.")
-                break
+                print("프로그램을 종료합니다."); break
             else:
                 print("잘못된 입력입니다. P, B, T 중 하나를 입력하세요.")
 
