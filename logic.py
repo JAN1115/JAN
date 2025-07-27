@@ -1,153 +1,106 @@
 import numpy as np
-from collections import deque
+import xgboost
+import joblib
+from collections import deque, Counter
+import pandas as pd
+import json
+from scipy.stats import mode
 
-# --- [핵심 로직] 상시 위기 대응 알고리즘 ---
-def predict_always_in_chaos(pb_history, current_chaos_strategy):
-    """'안정' 모드 없이, 항상 '자동 스위칭' 위기 대응 로직만으로 예측합니다."""
-    if len(pb_history) < 2:
-        return None
-
-    if pb_history[-1] == pb_history[-2]:
-        trend = pb_history[-1]
-        if current_chaos_strategy == 'counter':
-            return 'B' if trend == 'P' else 'P'
-        else:
-            return trend
-    else:
+class FeatureExtractor:
+    def __init__(self): self.reset()
+    def reset(self): self.current_loss = 0; self.p_count = 0; self.b_count = 0; self.gap_history = deque(maxlen=10)
+    def update_state_from_history(self, pb_history):
+        self.reset();
+        if not pb_history: return
+        for i in range(1, len(pb_history)):
+            prev_slice = pb_history[:i]; current_val = pb_history[i]
+            if not prev_slice: continue
+            pred = self._predict_chaos(prev_slice)
+            if pred is not None and pred != current_val: self.current_loss += 1
+            else: self.current_loss = 0
+        self.p_count = pb_history.count('P'); self.b_count = pb_history.count('B')
+        gaps = []; p, b = 0, 0
+        for r in pb_history:
+            if r == 'P': p += 1
+            else: b += 1
+            gaps.append(p - b)
+        self.gap_history.extend(gaps[-10:])
+    def get_features(self, pb_history):
+        if len(pb_history) < 11: return None
+        self.update_state_from_history(pb_history)
+        pred_normal = self._predict_chaos(pb_history); pred_fast = pb_history[-1]; pred_delayed = pb_history[-2]; pred_momentum = self._predict_momentum()
+        vol_recent = sum(1 for i in range(-5, 0) if pb_history[i] != pb_history[i-1]); vol_prior = sum(1 for i in range(-10, -5) if pb_history[i] != pb_history[i-1]); volatility_delta = vol_recent - vol_prior
+        streak_events_10 = sum(1 for i in range(-10, 0) if pb_history[i] == pb_history[i-1]); chop_events_10 = 10 - streak_events_10; trend_dominance_score = streak_events_10 - chop_events_10
+        volatility_10 = sum(1 for i in range(-10, -1) if pb_history[i] != pb_history[i+1])
+        preds = [pred_normal, pred_fast, pred_delayed, pred_momentum]; valid_preds = [p for p in preds if p is not None]; consensus_score = 0
+        if len(valid_preds) > 1: p_votes = valid_preds.count('P'); b_votes = valid_preds.count('B'); consensus_score = max(p_votes, b_votes) / len(valid_preds)
+        last_val = pb_history[-1]; current_streak_len = 1
+        for i in range(len(pb_history) - 2, -1, -1):
+            if pb_history[i] == last_val: current_streak_len += 1
+            else: break
+        current_streak_type = (1 if last_val == 'P' else -1) if current_streak_len > 1 else 0
+        is_choppy = 1 if len(pb_history) >= 4 and pb_history[-1] != pb_history[-2] and pb_history[-2] != pb_history[-3] and pb_history[-3] != pb_history[-4] else 0
+        return {'pred_normal': 1 if pred_normal == 'P' else 0, 'pred_momentum': 1 if pred_momentum == 'P' else (0 if pred_momentum == 'B' else 0.5),'current_loss': self.current_loss, 'gap': self.p_count - self.b_count, 'total_count': len(pb_history),'lag_3': 1 if pb_history[-3] == 'P' else 0, 'lag_5': 1 if pb_history[-5] == 'P' else 0,'gap_ma_5': np.mean(list(self.gap_history)[-5:]) if len(self.gap_history) >= 5 else 0,'loss_x_gap': self.current_loss * (self.p_count - self.b_count), 'volatility_10': volatility_10,'consensus_score': consensus_score, 'current_streak_type': current_streak_type,'current_streak_length': current_streak_len, 'is_choppy': is_choppy, 'volatility_delta': volatility_delta, 'trend_dominance_score': trend_dominance_score}
+    def _predict_chaos(self, pb_history):
+        if len(pb_history) < 2: return None
         return 'B' if pb_history[-1] == 'P' else 'P'
+    def _predict_momentum(self):
+        if len(self.gap_history) < 5: return None
+        return 'P' if self.p_count > self.b_count else 'B'
 
-# ---------- AI 클래스 (다수결 필터 최종 버전) ----------
-class MLConcordanceAI:
-    # --- 설정값 ---
-    MOMENTUM_LOOKBACK = 10 # 격차 모멘텀을 분석할 과거 데이터의 길이
+class BaccaratAI_Ensemble:
+    def __init__(self, num_models=5):
+        self.models = []
+        self.feature_extractor = FeatureExtractor()
+        self.elite_features = None
+        self.analysis_text = "AI 대기 중..."
+        try:
+            with open('elite_features.json', 'r') as f:
+                self.elite_features = json.load(f)
+            for i in range(1, num_models + 1):
+                model_filename = f"baccarat_model_{i}.joblib"
+                self.models.append(joblib.load(model_filename))
+            print(f"✅ {num_models}개의 앙상블 모델 로딩 완료!")
+        except Exception as e:
+            print(f"🚨 모델 또는 elite_features.json 로딩 중 오류 발생: {e}")
+            self.models = []
 
-    def __init__(self):
-        self.reset_game()
+    def predict(self, game_history):
+        if not self.models or not self.elite_features:
+            self.analysis_text = "모델이 로드되지 않아 예측할 수 없습니다."
+            return None, 0.5, []
 
-    def reset_game(self):
-        self.history = []
-        self.game_history = []
-        self.hit_record = []
-        self.bet_count = 0
-        self.correct = 0
-        self.max_win = 0
-        self.max_loss = 0
-        self.current_win = 0
-        self.current_loss = 0
-        self.analysis_text = "AI 초기화 중..."
-        self.next_prediction = None
-        self.should_bet_now = False
-        self.chaos_strategy = 'counter'
-        self.prediction_mode = 'NORMAL'
+        pb_history = [r for r in game_history if r in 'PB']
+        all_features = self.feature_extractor.get_features(pb_history)
         
-        self.p_count = 0
-        self.b_count = 0
-        self.gap_history = []
+        if all_features is None:
+            self.analysis_text = "데이터가 부족하여 예측할 수 없습니다."
+            return None, 0.5, []
+
+        try:
+            feature_df = pd.DataFrame([all_features])[self.elite_features]
+        except KeyError as e:
+            self.analysis_text = f"특성 키 오류: {e}"
+            return None, 0.5, []
         
-        print("--- 새로운 게임(슈)을 시작합니다. (다수결 신뢰도 필터) ---")
+        individual_predictions = []
+        probas = []
+        for model in self.models:
+            pred_result = model.predict(feature_df)[0]
+            p_or_b = 'P' if pred_result == 1 else 'B'
+            individual_predictions.append(p_or_b)
+            pred_proba = model.predict_proba(feature_df)[0]
+            confidence = pred_proba[1] if p_or_b == 'P' else pred_proba[0]
+            probas.append(confidence)
 
-    def handle_input(self, result):
-        if result == 'P': self.p_count += 1
-        elif result == 'B': self.b_count += 1
-        if result in 'PB': self.gap_history.append(self.p_count - self.b_count)
-
-        if result == 'T':
-            self.history.append('T')
-            self.hit_record.append(None)
-        else:
-            hit = None
-            if self.should_bet_now:
-                hit = (self.next_prediction == result)
-                self.bet_count += 1
-                
-                if hit:
-                    self.correct += 1
-                    self.current_win += 1
-                    self.current_loss = 0
-                    if self.prediction_mode != 'NORMAL':
-                        self.prediction_mode = 'NORMAL'
-                else:
-                    self.current_win = 0
-                    self.current_loss += 1
-                    
-                    if self.prediction_mode == 'NORMAL':
-                        self.chaos_strategy = 'trend' if self.chaos_strategy == 'counter' else 'counter'
-
-                    # 혼합 방어 사이클 로직
-                    if self.current_loss == 2: self.prediction_mode = 'FAST'
-                    elif self.current_loss == 3: self.prediction_mode = 'DELAYED'
-                    elif self.current_loss == 4: self.prediction_mode = 'FAST'
-                    elif self.current_loss == 5: self.prediction_mode = 'DELAYED'
-                    elif self.current_loss >= 6:
-                        self.prediction_mode = 'NORMAL'
-
-                self.max_win = max(self.max_win, self.current_win)
-                self.max_loss = max(self.max_loss, self.current_loss)
-            
-            self.hit_record.append('O' if hit else ('X' if hit is not None else None))
-            self.history.append(result)
-            self.game_history.append(result)
+        if not individual_predictions: return None, 0.5, []
         
-        self.predict_next()
-
-    def _analyze_gap_momentum(self):
-        """P/B 격차의 역사를 분석하여 장기적인 추세를 예측합니다."""
-        if len(self.gap_history) < self.MOMENTUM_LOOKBACK: return None
-        recent_gaps = self.gap_history[-self.MOMENTUM_LOOKBACK:]
-        widening_count, narrowing_count = 0, 0
-        for i in range(1, len(recent_gaps)):
-            if abs(recent_gaps[i]) > abs(recent_gaps[i-1]): widening_count += 1
-            elif abs(recent_gaps[i]) < abs(recent_gaps[i-1]): narrowing_count += 1
+        vote_counts = Counter(individual_predictions)
+        final_prediction = vote_counts.most_common(1)[0][0]
         
-        if widening_count > narrowing_count:
-            return 'P' if self.p_count >= self.b_count else 'B'
-        elif narrowing_count > widening_count:
-            return 'B' if self.p_count >= self.b_count else 'P'
-        else:
-            return None
-
-    def predict_next(self):
-        pb_history = [r for r in self.game_history if r in 'PB']
+        confidence = np.mean([p for pred, p in zip(individual_predictions, probas) if pred == final_prediction])
         
-        # 1. AI 내부의 모든 예측 로직을 독립적으로 실행하여 투표 준비
-        pred_normal = predict_always_in_chaos(pb_history, self.chaos_strategy)
-        pred_fast = pb_history[-1] if len(pb_history) >= 1 else None
-        pred_delayed = pb_history[-2] if len(pb_history) >= 2 else None
-        pred_momentum = self._analyze_gap_momentum()
+        vote_counts_text = f"P {individual_predictions.count('P')} : B {individual_predictions.count('B')}"
+        self.analysis_text = f"AI 예측: {final_prediction} (신뢰도: {confidence:.2%}, 투표: {vote_counts_text})"
         
-        # 2. 투표 집계
-        votes = [p for p in [pred_normal, pred_fast, pred_delayed, pred_momentum] if p is not None]
-        p_votes = votes.count('P')
-        b_votes = votes.count('B')
-        
-        # 3. 다수결 또는 동률 처리 규칙에 따라 최종 예측 결정
-        final_prediction = None
-        decision_reason = ""
-
-        if p_votes > b_votes:
-            final_prediction = 'P'
-            decision_reason = f"다수결({p_votes}:{b_votes})에 따라 'P'를 선택합니다."
-        elif b_votes > p_votes:
-            final_prediction = 'B'
-            decision_reason = f"다수결({p_votes}:{b_votes})에 따라 'B'를 선택합니다."
-        else: # 동률일 경우, 현재 '혼합 방어 사이클' 모드의 예측을 우선
-            current_mode_pred = None
-            if self.prediction_mode == 'FAST': current_mode_pred = pred_fast
-            elif self.prediction_mode == 'DELAYED': current_mode_pred = pred_delayed
-            else: current_mode_pred = pred_normal
-            
-            final_prediction = current_mode_pred
-            decision_reason = f"동률({p_votes}:{b_votes})! 현재 모드({self.prediction_mode}) 예측 '{final_prediction}'을 우선합니다."
-
-        self.next_prediction = final_prediction
-        self.should_bet_now = (self.next_prediction is not None)
-
-        # 분석 텍스트 생성
-        vote_text = f"투표-> 일반:{pred_normal}, 빠른:{pred_fast}, 지연:{pred_delayed}, 모멘텀:{pred_momentum}"
-        self.analysis_text = f"{vote_text}\n➡️ {decision_reason}"
-        
-    def get_stats(self):
-        accuracy = (self.correct / self.bet_count * 100) if self.bet_count > 0 else 0
-        return { "총입력": len(self.history), "베팅횟수": self.bet_count, "적중률(%)": f"{accuracy:.2f}",
-            "현재연승": self.current_win, "최대연승": self.max_win, "현재연패": self.current_loss,
-            "최대연패": self.max_loss, "현재모드": self.prediction_mode }
+        return final_prediction, confidence, individual_predictions
