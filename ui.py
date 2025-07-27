@@ -1,10 +1,7 @@
-# ui.py
-
 import streamlit as st
 import numpy as np
 
 def render_css():
-    """앱 전체에 적용될 CSS 스타일을 렌더링합니다."""
     st.markdown("""
     <style>
     html, body, [data-testid="stAppViewContainer"], [data-testid="stHeader"] { background: #0c111b !important; color: #e0fcff !important; }
@@ -25,6 +22,10 @@ def render_css():
     @keyframes fire-burn { 0%, 100% { transform: scale(1.0) rotate(-1deg); } 50% { transform: scale(1.15) rotate(1deg); } }
     .skull-animation { display: inline-block; animation: skull-shake 0.4s infinite linear; text-shadow: 0 0 5px #f44336, 0 0 10px #f44336; }
     @keyframes skull-shake { 0%, 100% { transform: translateY(0) rotate(0); } 25% { transform: translateY(1px) rotate(-3deg); } 75% { transform: translateY(-1px) rotate(3deg); } }
+    .mode-indicator { font-size: 0.9em; font-weight: bold; padding: 2px 8px; border-radius: 6px; margin-left: 10px; }
+    .mode-ai { background-color: rgba(0, 128, 128, 0.3); color: #00e6e6; border: 1px solid #008080; }
+    .mode-trend { background-color: rgba(76, 175, 80, 0.3); color: #81c784; border: 1px solid #2e7d32; }
+    .mode-choppy { background-color: rgba(255, 87, 34, 0.3); color: #ffab91; border: 1px solid #d84315; }
     .ai-waiting-bar { background: linear-gradient(90deg, rgba(43,41,0,0.6) 0%, rgba(80,70,0,0.9) 50%, rgba(43,41,0,0.6) 100%); border-radius: 10px; padding: 12px; margin: 10px 0 15px 0; color: #ffd400; font-size: 1.2em; font-weight: 900; text-align: center; width: 100%; }
     .blinking-text { animation: blink-animation 2s linear infinite; }
     @keyframes blink-animation { 50% { opacity: 0.4; } }
@@ -36,11 +37,7 @@ def render_css():
     .history-container { margin-bottom: 10px; }
     .history-table { border-spacing: 2px 1px; width: 100%; }
     .history-cell { padding: 0; text-align: center; height: 26px; width: 26px; }
-    .history-symbol {
-        border-radius: 50%; font-weight: bold; font-size: 12px;
-        display: inline-flex; align-items: center; justify-content: center;
-        width: 22px; height: 22px; line-height: 1;
-    }
+    .history-symbol { border-radius: 50%; font-weight: bold; font-size: 12px; display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; line-height: 1;}
     .sixgrid-fluo { color:#d4ffb3; background:rgba(100,255,110,.25); }
     .sixgrid-miss { color:#ffb3b3; background:rgba(255,100,110,.25); }
     @media (max-width: 768px) {
@@ -52,15 +49,10 @@ def render_css():
         .desktop-only { display: none; }
         .mobile-only { display: inline; }
     }
-    @media (max-width: 400px) {
-        .history-cell { height: 22px; width: 22px; }
-        .history-symbol { font-size: 10px; width: 18px; height: 18px; }
-    }
     </style>
     """, unsafe_allow_html=True)
 
 def render_history_table(pred):
-    """결과 기록 테이블을 HTML로 렌더링합니다."""
     st.markdown("---")
     history, hitrec = pred.history, pred.hit_record
     max_row = 6
@@ -86,7 +78,6 @@ def render_history_table(pred):
     st.markdown("---")
 
 def render_stats_panel(pred):
-    """통계 정보 패널을 렌더링합니다."""
     if st.session_state.show_stats:
         s = pred.get_stats()
         prev_s = st.session_state.get('prev_stats', {})
@@ -94,7 +85,6 @@ def render_stats_panel(pred):
         loss_anim_class = "stat-changed-neon" if s['현재연패'] > 0 and s['현재연패'] != prev_s.get('현재연패', 0) else ""
         win_icon = f"<span class='fire-animation'>🔥</span>" if s['현재연승'] > 0 else "⚪"
         loss_icon = f"<span class='skull-animation'>💀</span>" if s['현재연패'] > 0 else "⚪"
-
         st.markdown(f"""
         <div class="top-stats-grid">
             <div class="stat-item"><span class="stat-label">🎯 적중률</span><span class="stat-value">{s['적중률(%)']}%</span></div>
@@ -106,11 +96,17 @@ def render_stats_panel(pred):
         st.session_state.prev_stats = s.copy()
 
 def render_ai_analysis(pred):
-    """AI 분석 및 예측 결과를 렌더링합니다."""
     if st.session_state.show_ai_analysis:
-        st.markdown(f"🧠 **AI 분석**: {pred.analysis_text}", unsafe_allow_html=True)
-        npred, should_bet = pred.next_prediction, pred.should_bet_now
-        if should_bet and npred:
+        mode = pred.system_mode
+        mode_map = {"AI": "🤖 AI 예측", "TREND": "📈 추세 추종", "CHOPPY": "🔥 퐁당퐁당"}
+        mode_display = f"<span class='mode-indicator mode-{mode.lower()}'>{mode_map.get(mode, '대기')}</span>"
+        
+        st.markdown(f"<div>🧠 **AI 분석** {mode_display}</div>", unsafe_allow_html=True)
+        st.markdown(f"<div style='font-size:0.95em; color:#a0c8d0; margin-left:5px; margin-top:5px;'>{pred.analysis_text}</div>", unsafe_allow_html=True)
+        
+        recommendation, should_bet = pred.final_recommendation, pred.should_bet_now
+        
+        if should_bet and recommendation:
             turn_count = pred.get_stats()['총입력']
             entrance_animation_name = f"pop-in-effect-{turn_count}"
             st.markdown(f"""
@@ -119,27 +115,23 @@ def render_ai_analysis(pred):
             .animated-prediction-icon {{ display: inline-block; font-size: 2.5em; animation: {entrance_animation_name} 0.8s cubic-bezier(0.250, 0.460, 0.450, 0.940) both, pulse-glow 2.5s ease-in-out infinite 1s; }}
             </style>""", unsafe_allow_html=True)
             ICONS = {'P': '🔵', 'B': '🔴'}
-            st.markdown(f'''<div style="text-align:center; margin:5px 0 15px 0; height: 60px; display:flex; align-items:center; justify-content:center;"><span class="animated-prediction-icon">{ICONS.get(npred, npred)}</span></div>''', unsafe_allow_html=True)
+            st.markdown(f'''<div style="text-align:center; margin:5px 0 15px 0; height: 60px; display:flex; align-items:center; justify-content:center;"><span class="animated-prediction-icon">{ICONS.get(recommendation, recommendation)}</span></div>''', unsafe_allow_html=True)
         else:
-            display_text = pred.analysis_text.split(":")[-1].strip()
+            display_text = "데이터 수집 중..." if len(pred.history) < 10 else "AI 대기 중..."
             is_collecting = "데이터 수집 중" in display_text
             anim_class = "blinking-text" if is_collecting else ""
-            st.markdown(f'<div class="ai-waiting-bar {anim_class}"><span class="rotating-hourglass">⏳</span> {display_text}...</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="ai-waiting-bar {anim_class}" style="margin-top:15px;"><span class="rotating-hourglass">⏳</span> {display_text}</div>', unsafe_allow_html=True)
 
 def render_controls(handle_click, handle_undo, handle_reset):
-    """입력 버튼, 되돌리기, 초기화 등 컨트롤 버튼을 렌더링합니다."""
     button_cols = st.columns([1, 1, 1, 0.5, 0.5, 1.2])
     button_cols[0].button("플레이어 (P)", use_container_width=True, on_click=handle_click, args=("P",))
     button_cols[1].button("뱅커 (B)", use_container_width=True, on_click=handle_click, args=("B",))
     button_cols[2].button("타이 (T)", use_container_width=True, on_click=handle_click, args=("T",))
-
-    if button_cols[3].button("↩️", help="이전 상태로 되돌립니다.", on_click=handle_undo):
-        st.rerun()
-
-    if button_cols[4].button("🗑️", help="모든 기록을 초기화합니다.", on_click=handle_reset):
-        st.rerun()
-
+    if button_cols[3].button("↩️", help="이전 상태로 되돌립니다.", on_click=handle_undo): st.rerun()
+    if button_cols[4].button("🗑️", help="모든 기록을 초기화합니다.", on_click=handle_reset): st.rerun()
     with button_cols[5].expander("⚙️ 설정", expanded=False):
-        st.toggle("통계 표시", key="show_stats", help="적중률, 총 베팅, 연승/연패 통계를 표시하거나 숨깁니다.")
-        st.toggle("AI 분석 표시", key="show_ai_analysis", help="AI의 분석 및 다음 예측을 표시하거나 숨깁니다.")
-        st.toggle("적중/미적중 알림 표시", key="show_overlay_setting", help="베팅 결과에 따라 화면 우측 상단에 알림을 표시합니다.")
+        st.toggle("통계 표시", key="show_stats")
+        st.toggle("AI 분석 표시", key="show_ai_analysis")
+        st.toggle("적중/미적중 알림 표시", key="show_overlay_setting")
+        # --- 로직 수정: 새로운 설정 토글 추가 ---
+        st.toggle("타이(T)를 턴 카운트에 포함", key="count_tie_in_cycle", help="체크하면 타이가 나와도 예측 주기의 턴이 소모됩니다. 체크 해제 시 P, B 결과에만 턴이 소모됩니다.")
