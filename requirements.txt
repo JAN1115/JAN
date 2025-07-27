@@ -9,8 +9,4 @@ streamlit==1.32.0
 joblib
 lightgbm
 hmmlearn
-streamlit
-numpy
 xgboost
-pandas
-scipy
