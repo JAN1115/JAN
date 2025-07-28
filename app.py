@@ -104,12 +104,12 @@ class UIDataContainer:
             
             if turn in inverse_turns:
                 self.final_recommendation = 'B' if raw_prediction == 'P' else 'P'
-                self.overlay_mode = "반대"
+                self.overlay_mode = "전환"
             else:
                 self.final_recommendation = raw_prediction
                 self.overlay_mode = "일반"
 
-            overlay_text = f" | **겉값: {self.overlay_mode} ({turn + 1}/10)**"
+            overlay_text = f" | **값: {self.overlay_mode} ({turn + 1}/10)**"
             self.analysis_text = st.session_state.analysis_text + overlay_text
         else:
              self.analysis_text = st.session_state.analysis_text
