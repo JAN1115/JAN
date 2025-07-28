@@ -1,106 +1,172 @@
 import numpy as np
-import xgboost
-import joblib
-from collections import deque, Counter
 import pandas as pd
-import json
-from scipy.stats import mode
+import joblib
+from collections import Counter, deque
+import random
+import xgboost as xgb
+from sklearn.ensemble import VotingClassifier
 
-class FeatureExtractor:
-    def __init__(self): self.reset()
-    def reset(self): self.current_loss = 0; self.p_count = 0; self.b_count = 0; self.gap_history = deque(maxlen=10)
-    def update_state_from_history(self, pb_history):
-        self.reset();
-        if not pb_history: return
-        for i in range(1, len(pb_history)):
-            prev_slice = pb_history[:i]; current_val = pb_history[i]
-            if not prev_slice: continue
-            pred = self._predict_chaos(prev_slice)
-            if pred is not None and pred != current_val: self.current_loss += 1
-            else: self.current_loss = 0
-        self.p_count = pb_history.count('P'); self.b_count = pb_history.count('B')
-        gaps = []; p, b = 0, 0
-        for r in pb_history:
-            if r == 'P': p += 1
-            else: b += 1
-            gaps.append(p - b)
-        self.gap_history.extend(gaps[-10:])
-    def get_features(self, pb_history):
-        if len(pb_history) < 11: return None
-        self.update_state_from_history(pb_history)
-        pred_normal = self._predict_chaos(pb_history); pred_fast = pb_history[-1]; pred_delayed = pb_history[-2]; pred_momentum = self._predict_momentum()
-        vol_recent = sum(1 for i in range(-5, 0) if pb_history[i] != pb_history[i-1]); vol_prior = sum(1 for i in range(-10, -5) if pb_history[i] != pb_history[i-1]); volatility_delta = vol_recent - vol_prior
-        streak_events_10 = sum(1 for i in range(-10, 0) if pb_history[i] == pb_history[i-1]); chop_events_10 = 10 - streak_events_10; trend_dominance_score = streak_events_10 - chop_events_10
-        volatility_10 = sum(1 for i in range(-10, -1) if pb_history[i] != pb_history[i+1])
-        preds = [pred_normal, pred_fast, pred_delayed, pred_momentum]; valid_preds = [p for p in preds if p is not None]; consensus_score = 0
-        if len(valid_preds) > 1: p_votes = valid_preds.count('P'); b_votes = valid_preds.count('B'); consensus_score = max(p_votes, b_votes) / len(valid_preds)
-        last_val = pb_history[-1]; current_streak_len = 1
-        for i in range(len(pb_history) - 2, -1, -1):
-            if pb_history[i] == last_val: current_streak_len += 1
-            else: break
-        current_streak_type = (1 if last_val == 'P' else -1) if current_streak_len > 1 else 0
-        is_choppy = 1 if len(pb_history) >= 4 and pb_history[-1] != pb_history[-2] and pb_history[-2] != pb_history[-3] and pb_history[-3] != pb_history[-4] else 0
-        return {'pred_normal': 1 if pred_normal == 'P' else 0, 'pred_momentum': 1 if pred_momentum == 'P' else (0 if pred_momentum == 'B' else 0.5),'current_loss': self.current_loss, 'gap': self.p_count - self.b_count, 'total_count': len(pb_history),'lag_3': 1 if pb_history[-3] == 'P' else 0, 'lag_5': 1 if pb_history[-5] == 'P' else 0,'gap_ma_5': np.mean(list(self.gap_history)[-5:]) if len(self.gap_history) >= 5 else 0,'loss_x_gap': self.current_loss * (self.p_count - self.b_count), 'volatility_10': volatility_10,'consensus_score': consensus_score, 'current_streak_type': current_streak_type,'current_streak_length': current_streak_len, 'is_choppy': is_choppy, 'volatility_delta': volatility_delta, 'trend_dominance_score': trend_dominance_score}
-    def _predict_chaos(self, pb_history):
-        if len(pb_history) < 2: return None
-        return 'B' if pb_history[-1] == 'P' else 'P'
-    def _predict_momentum(self):
-        if len(self.gap_history) < 5: return None
-        return 'P' if self.p_count > self.b_count else 'B'
+class BaccaratShoe:
+    def __init__(self):
+        self.shoe = []
+        self.reset_shoe()
+    def reset_shoe(self):
+        single_deck = [2, 3, 4, 5, 6, 7, 8, 9, 0, 0, 0, 0, 1] * 4
+        self.shoe = single_deck * 8
+        random.shuffle(self.shoe)
+        self.burn_cards()
+        self.set_cut_card()
+    def burn_cards(self):
+        if not self.shoe: return
+        first_card = self.shoe.pop(0)
+        num_to_burn = 10 if first_card == 0 else first_card
+        for _ in range(num_to_burn):
+            if self.shoe: self.shoe.pop(0)
+    def set_cut_card(self):
+        cut_position = random.randint(70 * 5, 75 * 5)
+        if cut_position < len(self.shoe): self.shoe = self.shoe[:-cut_position]
+    def _get_card_value(self):
+        if not self.shoe: self.reset_shoe()
+        return self.shoe.pop(0)
+    def deal(self):
+        player_cards = [self._get_card_value(), self._get_card_value()]
+        banker_cards = [self._get_card_value(), self._get_card_value()]
+        player_score = sum(player_cards) % 10
+        banker_score = sum(banker_cards) % 10
+        if player_score < 8 and banker_score < 8:
+            if player_score <= 5:
+                player_third_card = self._get_card_value()
+                player_cards.append(player_third_card)
+                if (banker_score <= 2) or \
+                   (banker_score == 3 and player_third_card != 8) or \
+                   (banker_score == 4 and player_third_card in [2,3,4,5,6,7]) or \
+                   (banker_score == 5 and player_third_card in [4,5,6,7]) or \
+                   (banker_score == 6 and player_third_card in [6,7]):
+                    banker_cards.append(self._get_card_value())
+            elif banker_score <= 5:
+                banker_cards.append(self._get_card_value())
+        player_final = sum(player_cards) % 10
+        banker_final = sum(banker_cards) % 10
+        if player_final > banker_final: return 'P'
+        elif banker_final > player_final: return 'B'
+        else: return 'T'
+    def get_remaining_cards_info(self):
+        total = len(self.shoe)
+        if total == 0: return {'rem_cards': 0, 'rem_4_ratio': 0, 'rem_5_ratio': 0, 'rem_6_ratio': 0, 'rem_7_ratio': 0}
+        counts = Counter(self.shoe)
+        return {'rem_cards': total, 'rem_4_ratio': counts.get(4, 0)/total, 'rem_5_ratio': counts.get(5, 0)/total, 'rem_6_ratio': counts.get(6, 0)/total, 'rem_7_ratio': counts.get(7, 0)/total}
 
-class BaccaratAI_Ensemble:
-    def __init__(self, num_models=5):
-        self.models = []
-        self.feature_extractor = FeatureExtractor()
-        self.elite_features = None
+class BaccaratAI:
+    def __init__(self):
+        self.models = {}
+        self.shoe = BaccaratShoe()
+        self.full_history = []
+        self.prediction_history = [] # AI 자신의 예측 기록을 저장
+        self.load_models()
         self.analysis_text = "AI 대기 중..."
-        try:
-            with open('elite_features.json', 'r') as f:
-                self.elite_features = json.load(f)
-            for i in range(1, num_models + 1):
-                model_filename = f"baccarat_model_{i}.joblib"
-                self.models.append(joblib.load(model_filename))
-            print(f"✅ {num_models}개의 앙상블 모델 로딩 완료!")
-        except Exception as e:
-            print(f"🚨 모델 또는 elite_features.json 로딩 중 오류 발생: {e}")
-            self.models = []
+        self.system_mode = "AI"
+
+    def load_models(self):
+        model_names = ['general_1', 'general_2', 'streak', 'choppy', 'breaker', 'ensemble']
+        for name in model_names:
+            try:
+                self.models[name] = joblib.load(f"baccarat_model_{name}.joblib")
+            except FileNotFoundError:
+                print(f"Warning: Model file baccarat_model_{name}.joblib not found.")
+        if not self.models:
+            print("Error: No models were loaded.")
+
+    def _extract_features(self, full_history, prediction_history):
+        pb_history = [r for r in full_history if r in 'PB']
+        if len(pb_history) < 10: return None
+        
+        features = {}
+        # --- 기존 특징 ---
+        features['p_ratio'] = pb_history.count('P') / len(pb_history)
+        features['b_ratio'] = pb_history.count('B') / len(pb_history)
+        features['last_is_p'] = 1 if pb_history[-1] == 'P' else 0
+        
+        current_streak_len = 0
+        if len(pb_history) > 1:
+            last_result = pb_history[-1]
+            for i in range(len(pb_history) - 2, -1, -1):
+                if pb_history[i] == last_result: current_streak_len += 1
+                else: break
+        features['streak_len'] = current_streak_len + 1
+        
+        # --- 새로운 메타 특징 (Meta-Features) ---
+        
+        # 1. 패턴 밀림 (Lag) 감지
+        features['prediction_lag_1'] = 0
+        if len(prediction_history) >= 2 and len(pb_history) >= 2:
+            if prediction_history[-2] == pb_history[-1]:
+                features['prediction_lag_1'] = 1
+
+        # 2. 통계적 모멘텀 (변화율)
+        if len(pb_history) >= 10:
+            p_ratio_last_5 = pb_history[-5:].count('P') / 5
+            p_ratio_prev_5 = pb_history[-10:-5].count('P') / 5
+            features['p_ratio_momentum'] = p_ratio_last_5 - p_ratio_prev_5
+        else:
+            features['p_ratio_momentum'] = 0
+
+        # 3. 변동성 가속도
+        if len(pb_history) >= 20:
+            changes_last_10 = np.diff([1 if r == 'P' else 0 for r in pb_history[-10:]])
+            volatility_last_10 = np.sum(np.abs(changes_last_10))
+            changes_prev_10 = np.diff([1 if r == 'P' else 0 for r in pb_history[-20:-10:]])
+            volatility_prev_10 = np.sum(np.abs(changes_prev_10))
+            features['volatility_acceleration'] = volatility_last_10 - volatility_prev_10
+        else:
+            features['volatility_acceleration'] = 0
+            
+        features.update(self.shoe.get_remaining_cards_info())
+        return features
 
     def predict(self, game_history):
-        if not self.models or not self.elite_features:
-            self.analysis_text = "모델이 로드되지 않아 예측할 수 없습니다."
-            return None, 0.5, []
+        self.full_history = game_history
+        pb_history = [r for r in self.full_history if r in 'PB']
+        
+        if len(self.models) < 6: return None, 0.5, [], "AI"
 
-        pb_history = [r for r in game_history if r in 'PB']
-        all_features = self.feature_extractor.get_features(pb_history)
-        
-        if all_features is None:
-            self.analysis_text = "데이터가 부족하여 예측할 수 없습니다."
-            return None, 0.5, []
+        features = self._extract_features(self.full_history, self.prediction_history)
+        if features is None:
+            self.analysis_text = f"{10 - len(pb_history)}턴의 데이터가 더 필요합니다."
+            return None, 0.5, [], "AI"
 
-        try:
-            feature_df = pd.DataFrame([all_features])[self.elite_features]
-        except KeyError as e:
-            self.analysis_text = f"특성 키 오류: {e}"
-            return None, 0.5, []
+        feature_df = pd.DataFrame([features])
         
-        individual_predictions = []
-        probas = []
-        for model in self.models:
-            pred_result = model.predict(feature_df)[0]
-            p_or_b = 'P' if pred_result == 1 else 'B'
-            individual_predictions.append(p_or_b)
-            pred_proba = model.predict_proba(feature_df)[0]
-            confidence = pred_proba[1] if p_or_b == 'P' else pred_proba[0]
-            probas.append(confidence)
+        # 1. 모든 전문가 모델로부터 1차 예측 생성
+        specialist_predictions = {}
+        for name, model in self.models.items():
+            if name == 'ensemble': continue # 최종 모델은 제외
+            try:
+                model_features = model.get_booster().feature_names
+                feature_df_ordered = feature_df[model_features]
+                # P가 나올 확률만 추출
+                specialist_predictions[name] = model.predict_proba(feature_df_ordered)[0][1]
+            except Exception as e:
+                print(f"Specialist model '{name}' prediction error: {e}")
+                specialist_predictions[name] = 0.5 # 오류 발생 시 중간값
 
-        if not individual_predictions: return None, 0.5, []
+        # 2. 1차 예측 결과를 입력 데이터로 하여 최종 앙상블(상황실장) 모델이 예측
+        ensemble_input = pd.DataFrame([specialist_predictions])
+        ensemble_model = self.models['ensemble']
+
+        # --- ▼ [수정됨] 컬럼 순서를 강제로 고정 ---
+        model_names = ['general_1', 'general_2', 'breaker', 'streak', 'choppy']
+        ensemble_input = ensemble_input[model_names]
+        # --- ▲ [수정됨] 여기까지 ---
         
-        vote_counts = Counter(individual_predictions)
-        final_prediction = vote_counts.most_common(1)[0][0]
+        final_proba = ensemble_model.predict_proba(ensemble_input)[0]
+        p_proba_index = np.where(ensemble_model.classes_ == 1)[0][0]
         
-        confidence = np.mean([p for pred, p in zip(individual_predictions, probas) if pred == final_prediction])
+        final_prediction = 'P' if final_proba[p_proba_index] > 0.5 else 'B'
+        final_confidence = final_proba[p_proba_index] if final_prediction == 'P' else 1 - final_proba[p_proba_index]
         
-        vote_counts_text = f"P {individual_predictions.count('P')} : B {individual_predictions.count('B')}"
-        self.analysis_text = f"AI 예측: {final_prediction} (신뢰도: {confidence:.2%}, 투표: {vote_counts_text})"
+        # AI의 예측 기록 업데이트
+        self.prediction_history.append(final_prediction)
         
-        return final_prediction, confidence, individual_predictions
+        self.analysis_text = f"AI 예측: {final_prediction} (신뢰도: {final_confidence:.1%})"
+        
+        return final_prediction, final_confidence, [], "AI"
