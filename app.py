@@ -21,10 +21,9 @@ if 'stats' not in st.session_state:
 if 'analysis_text' not in st.session_state: st.session_state.analysis_text = "AI 대기 중..."
 if 'last_recommendation' not in st.session_state: st.session_state.last_recommendation = None
 if 'system_mode' not in st.session_state: st.session_state.system_mode = "AI"
-# --- 로직 수정: 3개의 주기 인덱스 초기화 ---
-if 'cycle_index_1' not in st.session_state: st.session_state.cycle_index_1 = 0 # 1차 주기 (19턴)
-if 'cycle_index_2' not in st.session_state: st.session_state.cycle_index_2 = 0 # 2차 주기 (4턴)
-if 'cycle_index_3' not in st.session_state: st.session_state.cycle_index_3 = 0 # 3차 주기 (10턴)
+# --- 로직 수정: 2개의 주기 인덱스 초기화 ---
+if 'cycle_index_1' not in st.session_state: st.session_state.cycle_index_1 = 0 # 1차 주기 (15턴)
+if 'cycle_index_2' not in st.session_state: st.session_state.cycle_index_2 = 0 # 2차 주기 (7턴)
 if 'internal_ai_loss_streak' not in st.session_state: st.session_state.internal_ai_loss_streak = 0
 if 'internal_ai_loss_streak_history' not in st.session_state: st.session_state.internal_ai_loss_streak_history = []
 if 'show_stats' not in st.session_state: st.session_state.show_stats = True
@@ -59,16 +58,14 @@ def handle_click(result):
     st.session_state.internal_ai_loss_streak_history.append(st.session_state.internal_ai_loss_streak)
     st.session_state.game_history.append(result)
 
-    # --- 로직 수정: 설정에 따라 모든 주기 인덱스 업데이트 ---
+    # --- 로직 수정: 주기 인덱스 업데이트 ---
     if st.session_state.get('count_tie_in_cycle', True):
-        st.session_state.cycle_index_1 = (st.session_state.cycle_index_1 + 1) % 19
-        st.session_state.cycle_index_2 = (st.session_state.cycle_index_2 + 1) % 4
-        st.session_state.cycle_index_3 = (st.session_state.cycle_index_3 + 1) % 10
+        st.session_state.cycle_index_1 = (st.session_state.cycle_index_1 + 1) % 15
+        st.session_state.cycle_index_2 = (st.session_state.cycle_index_2 + 1) % 7
     else:
         if result in ['P', 'B']:
-            st.session_state.cycle_index_1 = (st.session_state.cycle_index_1 + 1) % 19
-            st.session_state.cycle_index_2 = (st.session_state.cycle_index_2 + 1) % 4
-            st.session_state.cycle_index_3 = (st.session_state.cycle_index_3 + 1) % 10
+            st.session_state.cycle_index_1 = (st.session_state.cycle_index_1 + 1) % 15
+            st.session_state.cycle_index_2 = (st.session_state.cycle_index_2 + 1) % 7
 
     with st.spinner("AI가 다음 수를 분석 중입니다..."):
         ai = st.session_state.ai
@@ -97,16 +94,14 @@ def handle_undo():
         st.session_state.internal_ai_loss_streak = st.session_state.internal_ai_loss_streak_history[-1]
     else: st.session_state.internal_ai_loss_streak = 0
 
-    # --- 로직 수정: 설정에 따라 모든 주기 인덱스 감소 ---
+    # --- 로직 수정: 주기 인덱스 감소 ---
     if st.session_state.get('count_tie_in_cycle', True):
-        st.session_state.cycle_index_1 = (st.session_state.get('cycle_index_1', 0) - 1 + 19) % 19
-        st.session_state.cycle_index_2 = (st.session_state.get('cycle_index_2', 0) - 1 + 4) % 4
-        st.session_state.cycle_index_3 = (st.session_state.get('cycle_index_3', 0) - 1 + 10) % 10
+        st.session_state.cycle_index_1 = (st.session_state.get('cycle_index_1', 0) - 1 + 15) % 15
+        st.session_state.cycle_index_2 = (st.session_state.get('cycle_index_2', 0) - 1 + 7) % 7
     else:
         if last_result_to_undo in ['P', 'B']:
-            st.session_state.cycle_index_1 = (st.session_state.get('cycle_index_1', 0) - 1 + 19) % 19
-            st.session_state.cycle_index_2 = (st.session_state.get('cycle_index_2', 0) - 1 + 4) % 4
-            st.session_state.cycle_index_3 = (st.session_state.get('cycle_index_3', 0) - 1 + 10) % 10
+            st.session_state.cycle_index_1 = (st.session_state.get('cycle_index_1', 0) - 1 + 15) % 15
+            st.session_state.cycle_index_2 = (st.session_state.get('cycle_index_2', 0) - 1 + 7) % 7
 
     stats = st.session_state.stats
     temp_hit_record = [h for h in st.session_state.hit_record if h is not None]
@@ -151,50 +146,38 @@ class UIDataContainer:
             if last_pb_result:
                 raw_prediction = last_pb_result
         
-        # --- 로직 수정: 3중 주기 적용 ---
-        # 1. 1차 주기 (겉값1) 적용
+        # --- 1차 주기 (기존 3-2-2-3-1-4) 적용 ---
         bet_layer_1 = raw_prediction
         cycle_index_1 = st.session_state.get('cycle_index_1', 0)
-        p2_1 = (cycle_index_1 >= 3 and cycle_index_1 <= 4)
-        p4_1 = (cycle_index_1 >= 7 and cycle_index_1 <= 9)
-        p6_1 = (cycle_index_1 >= 13 and cycle_index_1 <= 14)
-        p8_1 = (cycle_index_1 == 18)
-        is_inverted_1 = p2_1 or p4_1 or p6_1 or p8_1
+        is_inverted_1 = (3 <= cycle_index_1 <= 4) or \
+                      (7 <= cycle_index_1 <= 9) or \
+                      (11 <= cycle_index_1 <= 14)
         if is_inverted_1 and bet_layer_1 in ['P', 'B']:
             bet_layer_1 = 'B' if bet_layer_1 == 'P' else 'P'
 
-        # 2. 2차 주기 (겉값2) 적용
-        bet_layer_2 = bet_layer_1
+        # --- 2차 주기 ("3-4" 패턴) 적용 ---
+        self.final_recommendation = bet_layer_1  # 1차 결과를 2차 주기의 입력값으로 사용
         cycle_index_2 = st.session_state.get('cycle_index_2', 0)
-        is_inverted_2 = (cycle_index_2 >= 2) # 2턴 그대로(0,1), 2턴 반대로(2,3)
-        if is_inverted_2 and bet_layer_2 in ['P', 'B']:
-            bet_layer_2 = 'B' if bet_layer_2 == 'P' else 'P'
-            
-        # 3. 3차 주기 (겉값3) 적용
-        self.final_recommendation = bet_layer_2
-        cycle_index_3 = st.session_state.get('cycle_index_3', 0)
-        # 3-2-2-3 주기 로직 (10턴)
-        is_inverted_3 = (cycle_index_3 >= 3 and cycle_index_3 <= 4) or \
-                        (cycle_index_3 >= 7 and cycle_index_3 <= 9)
-        if is_inverted_3 and self.final_recommendation in ['P', 'B']:
+        # 3턴 정벳(0,1,2), 4턴 역벳(3,4,5,6)
+        is_inverted_2 = (cycle_index_2 >= 3)
+        if is_inverted_2 and self.final_recommendation in ['P', 'B']:
             self.final_recommendation = 'B' if self.final_recommendation == 'P' else 'P'
-
-        # 4. UI 텍스트 업데이트
+            
+        # --- UI 텍스트 업데이트 ---
         current_analysis_text = st.session_state.analysis_text
-        status_text = "전환분석" if (bet_layer_2 != self.final_recommendation) else "일반분석"
+        # 최종 분석 상태 결정 (1차 또는 2차에서 하나라도 전환되었으면 '전환분석')
+        status_text = "전환분석" if (raw_prediction != self.final_recommendation) else "일반분석"
         
         if st.session_state.get('count_tie_in_cycle', True):
             total_turns = len(self.history)
-            turn1 = ((total_turns - 1) % 19) + 1 if total_turns > 0 else 1
-            turn2 = ((total_turns - 1) % 4) + 1 if total_turns > 0 else 1
-            turn3 = ((total_turns - 1) % 10) + 1 if total_turns > 0 else 1
+            turn1 = ((total_turns - 1) % 15) + 1 if total_turns > 0 else 1
+            turn2 = ((total_turns - 1) % 7) + 1 if total_turns > 0 else 1
         else:
             pb_count = sum(1 for r in self.history if r in 'PB')
-            turn1 = ((pb_count - 1) % 19) + 1 if pb_count > 0 else 1
-            turn2 = ((pb_count - 1) % 4) + 1 if pb_count > 0 else 1
-            turn3 = ((pb_count - 1) % 10) + 1 if pb_count > 0 else 1
+            turn1 = ((pb_count - 1) % 15) + 1 if pb_count > 0 else 1
+            turn2 = ((pb_count - 1) % 7) + 1 if pb_count > 0 else 1
         
-        turn_info = f"(1차 {turn1}/19 | 2차 {turn2}/4 | 3차 {turn3}/10: 최종 {status_text})"
+        turn_info = f"(1차 {turn1}/15 | 2차 {turn2}/7: 최종 {status_text})"
         self.analysis_text = f"{current_analysis_text} {turn_info}"
         # --------------------------------
 
