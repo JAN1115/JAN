@@ -8,7 +8,6 @@ render_css()
 
 # --- 세션 상태 초기화 ---
 if 'ai' not in st.session_state:
-    # --- 수정된 부분: BaccaratAI() 호출 방식을 새 버전에 맞게 변경 ---
     st.session_state.ai = BaccaratAI()
     if not st.session_state.ai.models:
         st.error("모델 파일을 찾을 수 없습니다. create_model.py를 먼저 실행해주세요.")
@@ -93,26 +92,13 @@ class UIDataContainer:
         self.history = st.session_state.game_history
         self.hit_record = st.session_state.hit_record
         
+        # --- ▼ [수정됨] 겉값(Overlay) 로직 제거 ---
+        # AI의 순수 예측값을 그대로 사용합니다.
         raw_prediction = st.session_state.predictions[-1] if st.session_state.predictions else None
-
-        self.final_recommendation = raw_prediction
-        self.overlay_mode = "대기"
         
-        if raw_prediction:
-            turn = stats['bet_count'] % 10
-            inverse_turns = [1, 2, 6, 7, 8, 9]
-            
-            if turn in inverse_turns:
-                self.final_recommendation = 'B' if raw_prediction == 'P' else 'P'
-                self.overlay_mode = "전환"
-            else:
-                self.final_recommendation = raw_prediction
-                self.overlay_mode = "일반"
-
-            overlay_text = f" | **값: {self.overlay_mode} ({turn + 1}/10)**"
-            self.analysis_text = st.session_state.analysis_text + overlay_text
-        else:
-             self.analysis_text = st.session_state.analysis_text
+        self.final_recommendation = raw_prediction
+        self.analysis_text = st.session_state.analysis_text
+        # --- ▲ [수정됨] 여기까지 ---
 
         self.system_mode = st.session_state.system_mode
         self.bet_count = stats['bet_count']; self.correct = stats['correct']
